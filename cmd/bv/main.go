@@ -4545,10 +4545,26 @@ func main() {
 }
 
 func runTUIProgram(m *ui.Model) error {
+	// Only the interactive, local graphical TUI owns an IME lease. Robot,
+	// version, export and render paths never reach this program entrypoint.
+	stdin, inErr := os.Stdin.Stat()
+	stdout, outErr := os.Stdout.Stat()
+	localGUI := inErr == nil && outErr == nil &&
+		stdin.Mode()&os.ModeCharDevice != 0 && stdout.Mode()&os.ModeCharDevice != 0 &&
+		os.Getenv("SSH_CONNECTION") == "" && os.Getenv("SSH_CLIENT") == "" &&
+		os.Getenv("SSH_TTY") == "" && os.Getenv("TERM") != "dumb" &&
+		(runtime.GOOS == "darwin" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "")
+	if localGUI {
+		if err := m.EnableTUIIME(); err != nil {
+			fmt.Fprintln(os.Stderr, "bv: IME mode unprotected:", err)
+		}
+	}
+	defer m.CloseIME()
 	p := tea.NewProgram(
 		m,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
+		tea.WithReportFocus(),
 		tea.WithoutSignalHandler(),
 	)
 
@@ -4565,6 +4581,7 @@ func runTUIProgram(m *ui.Model) error {
 			return
 		case <-sigCh:
 		}
+		m.CloseIME()
 
 		p.Quit()
 

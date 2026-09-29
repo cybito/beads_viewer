@@ -785,6 +785,9 @@ type Model struct {
 	focused                  focus
 	focusBeforeHelp          focus // Stores focus before opening help overlay
 	embeddedTextInputSession embeddedTextInputSession
+	imeReporter              *imeReporter // TUI-only lease; absent for robot/render paths
+	imeFocused               bool
+	imeWarning               string
 	embeddedTextInputGen     uint64
 	isSplitView              bool
 	splitPaneRatio           float64 // Ratio of list pane width (0.2-0.8), default 0.4
@@ -2062,6 +2065,7 @@ func (m *Model) rebuildInsightsPanel() {
 }
 
 func (m *Model) Init() tea.Cmd {
+	m.reportIME()
 	// Note: ReadyTimeoutCmd is no longer needed since the model is now
 	// initialized as ready with default dimensions in NewModel().
 	// This eliminates the "Initializing..." phase entirely.
@@ -2202,7 +2206,7 @@ func (m *Model) updateEmbeddedTextInput(msg embeddedTextInputMsg) tea.Cmd {
 	return wrapEmbeddedTextInputCmd(msg.session, cmd)
 }
 
-func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 	defer func() {
@@ -2211,6 +2215,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cancelCassLookup()
 			} else if m.statusMsg == "" {
 				m.statusMsg = m.cassRequest.status
+			}
+		}
+		// A named return covers every early return, including the nested worker
+		// route. report() deduplicates the nested/outer transition.
+		if m.imeFocused {
+			// Do not stall background ticks on an unavailable service. Retry
+			// after actual user/focus/editor activity instead.
+			if m.imeWarning == "" {
+				m.reportIME()
+			} else {
+				switch msg.(type) {
+				case tea.KeyMsg, tea.MouseMsg, tea.FocusMsg, editorExitMsg:
+					m.reportIME()
+				}
 			}
 		}
 	}()
@@ -2223,6 +2241,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case tea.BlurMsg:
+		m.imeFocused = false
+		if m.imeReporter != nil {
+			m.noteIMEError(m.imeReporter.blur())
+		}
+		return m, nil
+
+	case tea.FocusMsg:
+		if m.imeReporter != nil {
+			m.imeFocused = true
+			if m.imeReporter.isSuspended() {
+				m.noteIMEError(m.imeReporter.resume(m.imeState()))
+			}
+		}
+		return m, nil
+
 	case embeddedTextInputMsg:
 		return m, m.updateEmbeddedTextInput(msg)
 
@@ -2364,6 +2398,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd, m.pendingSemanticFilterCmd())
 
 	case editorExitMsg:
+		if m.imeReporter != nil && m.imeFocused {
+			m.noteIMEError(m.imeReporter.resume(m.imeState()))
+		}
 		// Terminal editor exited — parse changes and apply via br update (bv-134)
 		defer os.Remove(msg.tmpFile)
 		if msg.err != nil {
@@ -5175,9 +5212,12 @@ func (m *Model) handleBoardKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		case "N":
 			m.board.PrevMatch()
 		default:
-			// Append printable characters to search query
-			if len(key) == 1 {
-				m.board.AppendSearchChar(rune(key[0]))
+			// Tea supplies Unicode code points, not one-byte strings. Reject
+			// control keys but accept composed Chinese (and pasted) text.
+			if msg.Type == tea.KeyRunes {
+				for _, char := range msg.Runes {
+					m.board.AppendSearchChar(char)
+				}
 			}
 		}
 		return m, nil
@@ -7310,6 +7350,9 @@ func (m *Model) renderFooter() string {
 	// POLISHED FOOTER - Stripe-level status bar with visual hierarchy
 	// ══════════════════════════════════════════════════════════════════════════
 
+	if m.imeWarning != "" {
+		return lipgloss.NewStyle().Foreground(ColorPrioCritical).Render("✗ " + m.imeWarning)
+	}
 	// If there's a status message, show it prominently with polished styling
 	if m.statusMsg != "" {
 		var msgStyle lipgloss.Style
@@ -10137,6 +10180,14 @@ func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
 
 	m.statusMsg = fmt.Sprintf("📝 Opening %s in %s...", issue.ID, filepath.Base(editorArgs[0]))
 	m.statusIsError = false
+	if m.imeReporter != nil {
+		// Do not hand the terminal to an editor until the daemon confirms release.
+		if err := m.imeReporter.suspend(); err != nil {
+			m.noteIMEError(err)
+			os.Remove(tmpPath)
+			return nil
+		}
+	}
 
 	return tea.ExecProcess(editorCmd, func(err error) tea.Msg {
 		return editorExitMsg{
@@ -10276,6 +10327,7 @@ func parseBodyFromFrontmatter(content string) string {
 // Stop cleans up resources (file watcher, instance lock, background worker, etc.)
 // Should be called when the program exits
 func (m *Model) Stop() {
+	m.CloseIME()
 	m.cancelHistoryLoad()
 	m.cancelPhase2Preparation()
 	m.cancelCassLookup()
