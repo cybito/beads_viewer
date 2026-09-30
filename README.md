@@ -9,7 +9,7 @@
 
 ## `custom/ime-reporter`：本地图形终端输入法
 
-此分支基于上游 `Dicklesworthstone/beads_viewer` 的 v0.25.0，保持 `upstream` 跟踪。仅交互式 TUI 在本地图形会话向用户级 `ime-control` Unix socket 上报命令/文本态、焦点、editor 暂停与退出；输入源采样、切换和恢复都由服务负责。list 过滤、board/History 搜索及 label/time-travel 输入框属于文本态，board 搜索接受中文 Unicode 字符。`--robot-*` 和版本查询不接触服务；服务不可用会显示未受保护警告。受管目标本地从固定源码提交构建，并以 `-ldflags '-X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v0.25.0-custom.1'` 区分原版。
+此分支基于上游 `Dicklesworthstone/beads_viewer` 的 v0.25.0，保持 `upstream` 跟踪。仅交互式 TUI 在本地图形会话向用户级 `ime-control` Unix socket 上报命令/文本态、焦点、editor 暂停与退出；输入源采样、切换和恢复都由服务负责。list 过滤、board/History 搜索及 label/time-travel 输入框属于文本态，board 搜索接受中文 Unicode 字符。`--robot-*` 和版本查询不接触服务；服务不可用或切换失败会报错并终止 TUI，不继续处理未受保护的命令键。受管目标本地从固定源码提交构建，并以 `-ldflags '-X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v0.25.0-custom.1'` 区分原版。
 
 <div align="center" style="margin: 1.2em 0;">
   <table>

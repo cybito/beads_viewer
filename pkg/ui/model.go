@@ -2066,6 +2066,9 @@ func (m *Model) rebuildInsightsPanel() {
 
 func (m *Model) Init() tea.Cmd {
 	m.reportIME()
+	if m.IMEFailure() != nil {
+		return tea.Quit
+	}
 	// Note: ReadyTimeoutCmd is no longer needed since the model is now
 	// initialized as ready with default dimensions in NewModel().
 	// This eliminates the "Initializing..." phase entirely.
@@ -2218,18 +2221,12 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 			}
 		}
 		// A named return covers every early return, including the nested worker
-		// route. report() deduplicates the nested/outer transition.
-		if m.imeFocused {
-			// Do not stall background ticks on an unavailable service. Retry
-			// after actual user/focus/editor activity instead.
-			if m.imeWarning == "" {
-				m.reportIME()
-			} else {
-				switch msg.(type) {
-				case tea.KeyMsg, tea.MouseMsg, tea.FocusMsg, editorExitMsg:
-					m.reportIME()
-				}
-			}
+		// route. No following command key can run after an ACK failure.
+		if m.imeFocused && m.imeReporter != nil {
+			m.reportIME()
+		}
+		if m.IMEFailure() != nil {
+			command = tea.Quit
 		}
 	}()
 

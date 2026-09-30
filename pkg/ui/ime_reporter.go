@@ -225,6 +225,15 @@ func (m *Model) EnableTUIIME() error {
 	}
 	m.imeReporter = newIMEReporter(path)
 	m.imeFocused = true
+	// Obtain the command-mode ACK before entering Bubble Tea's input loop.
+	return m.imeReporter.report(m.imeState())
+}
+
+// IMEFailure reports why the interactive TUI stopped without a protected mode.
+func (m *Model) IMEFailure() error {
+	if m.imeWarning != "" {
+		return errors.New(m.imeWarning)
+	}
 	return nil
 }
 

@@ -142,6 +142,68 @@ func TestTUIIMETransitionsWaitForACK(t *testing.T) {
 	}
 }
 
+func TestTUIIMEFailureQuitsBeforeAnotherCommandKey(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "bv-ime-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	path := filepath.Join(directory, "control.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := fmt.Fprintln(conn, `{"ok":true,"generation":1,"session":"test-lease"}`); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := reader.ReadBytes('\n'); err != nil {
+			serverDone <- err
+			return
+		}
+		_, err = fmt.Fprintln(conn, `{"ok":false,"generation":2,"error":"BACKEND_UNAVAILABLE"}`)
+		serverDone <- err
+	}()
+
+	m := NewModel([]model.Issue{{ID: "zh-1", Title: "中文", Status: model.StatusOpen}}, nil, "")
+	m.imeReporter = newIMEReporter(path)
+	m.imeFocused = true
+	defer m.Stop()
+	m.Init()
+	_, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	if m.IMEFailure() == nil {
+		t.Fatal("backend rejection must not leave the TUI in an unprotected mode")
+	}
+	if command == nil {
+		t.Fatal("backend rejection must terminate the TUI before another key")
+	}
+	if _, ok := command().(tea.QuitMsg); !ok {
+		t.Fatal("backend rejection did not request Bubble Tea quit")
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("service did not finish")
+	}
+}
+
 func TestTUIIMETextReceiversFollowRealKeys(t *testing.T) {
 	m := NewModel([]model.Issue{{ID: "zh-1", Title: "中文", Labels: []string{"backend"}, Status: model.StatusOpen}}, nil, "")
 	defer m.Stop()

@@ -4556,7 +4556,7 @@ func runTUIProgram(m *ui.Model) error {
 		(runtime.GOOS == "darwin" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "")
 	if localGUI {
 		if err := m.EnableTUIIME(); err != nil {
-			fmt.Fprintln(os.Stderr, "bv: IME mode unprotected:", err)
+			return fmt.Errorf("bv: IME command mode unavailable: %w", err)
 		}
 	}
 	defer m.CloseIME()
@@ -4622,12 +4622,13 @@ func runTUIProgram(m *ui.Model) error {
 	}
 
 	_, err := p.Run()
-	if err != nil {
-		if errors.Is(err, tea.ErrProgramKilled) || errors.Is(err, tea.ErrInterrupted) {
-			return nil
-		}
+	if err != nil && !errors.Is(err, tea.ErrProgramKilled) && !errors.Is(err, tea.ErrInterrupted) {
+		return err
 	}
-	return err
+	if err := m.IMEFailure(); err != nil {
+		return fmt.Errorf("bv: %w", err)
+	}
+	return nil
 }
 
 // countEdges counts blocking dependencies for config sizing
