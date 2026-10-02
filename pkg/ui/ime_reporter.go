@@ -2,9 +2,11 @@ package ui
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -14,19 +16,24 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 )
 
-// imeReporter holds one lease for the lifetime of the interactive TUI. It never
-// reads or changes an input source; the local ime-control service owns that state.
-// The mutex also serializes shutdown signals with Bubble Tea's Update goroutine.
+// imeReporter serializes one interactive app's lifecycle. Herdr receives only
+// intent; ordinary local terminals use the daemon that owns the input source.
+// A failed connection is never reopened with a cached mode.
 type imeReporter struct {
-	mu              sync.Mutex
-	path            string
-	conn            net.Conn
-	reader          *bufio.Reader
-	state           string
-	active          bool
-	suspended       bool
-	suspendInactive bool // blur already released this lease before editor handoff
-	closed          bool
+	mu             sync.Mutex
+	path           string
+	openParams     map[string]string // nil for the ordinary local daemon
+	conn           net.Conn
+	reader         *bufio.Reader
+	session        string
+	generation     uint64
+	state          string
+	declared       bool
+	active         bool // applied locally, or recorded by Herdr; never inferred
+	suspended      bool // terminal is currently handed to a child
+	resumeRequired bool
+	closed         bool
+	failure        error
 }
 
 type imeRequest struct {
@@ -39,7 +46,21 @@ type imeResponse struct {
 	OK         bool   `json:"ok"`
 	Generation uint64 `json:"generation"`
 	Session    string `json:"session"`
+	Scope      string `json:"scope"`
 	Error      string `json:"error"`
+}
+
+type imeOpenResponse struct {
+	ID     string `json:"id"`
+	Result *struct {
+		Type       string `json:"type"`
+		Session    string `json:"session"`
+		Generation uint64 `json:"generation"`
+	} `json:"result"`
+	Error *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 func newIMEReporter(path string) *imeReporter { return &imeReporter{path: path} }
@@ -52,22 +73,47 @@ func localIMESocket() (string, error) {
 	return filepath.Join(home, ".local/state/infra-as-code/ime-control/run/control.sock"), nil
 }
 
-// exchange waits for the daemon's durable-transition ACK before returning to
-// keyboard dispatch. A failed transaction drops the lease rather than claiming
-// that the requested mode was protected.
-func (r *imeReporter) exchange(request imeRequest) error {
-	if r.conn == nil {
-		conn, err := net.DialTimeout("unix", r.path, 2*time.Second)
+func selectIMEReporter() (*imeReporter, error) {
+	marker, present := os.LookupEnv("HERDR_IME_INTENT")
+	if !present {
+		path, err := localIMESocket()
 		if err != nil {
-			return fmt.Errorf("connect: %w", err)
+			return nil, err
 		}
-		r.conn = conn
-		r.reader = bufio.NewReaderSize(conn, 4096)
+		return newIMEReporter(path), nil
 	}
-	if err := r.conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		r.drop()
+	if marker != "1" {
+		return nil, errors.New("HERDR_IME_INTENT_UNSUPPORTED: expected marker 1")
+	}
+	if os.Getenv("HERDR_ENV") != "1" {
+		return nil, errors.New("HERDR_IME_INTENT_INVALID: HERDR_ENV must be 1")
+	}
+	pane, popup := os.Getenv("HERDR_PANE_ID"), os.Getenv("HERDR_IME_POPUP_TERMINAL_ID")
+	if (pane == "") == (popup == "") {
+		return nil, errors.New("HERDR_IME_INTENT_INVALID: exactly one pane or popup identity is required")
+	}
+	path := os.Getenv("HERDR_SOCKET_PATH")
+	field, identity := "pane_id", pane
+	if popup != "" {
+		field, identity = "popup_terminal_id", popup
+	}
+	params := map[string]string{field: identity}
+	return &imeReporter{path: path, openParams: params}, nil
+}
+
+func decodeIMEFrame(frame []byte, response any) error {
+	decoder := json.NewDecoder(bytes.NewReader(frame))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(response); err != nil {
 		return err
 	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return errors.New("multiple JSON values in IME ACK")
+	}
+	return nil
+}
+
+func (r *imeReporter) transact(request any, response any) error {
 	frame, err := json.Marshal(request)
 	if err != nil {
 		return err
@@ -78,34 +124,104 @@ func (r *imeReporter) exchange(request imeRequest) error {
 	}
 	n, err := r.conn.Write(frame)
 	if err != nil || n != len(frame) {
-		r.drop()
 		if err == nil {
 			err = errors.New("short IME request write")
 		}
-		return fmt.Errorf("send: %w", err)
+		return fmt.Errorf("send IME request: %w", err)
 	}
 	line, err := r.reader.ReadSlice('\n')
 	if err != nil || len(line) > 4096 {
-		r.drop()
-		if err == nil {
+		if err == nil || errors.Is(err, bufio.ErrBufferFull) {
 			err = errors.New("IME ACK exceeds 4096 bytes")
 		}
 		return fmt.Errorf("receive IME ACK: %w", err)
 	}
-	var response imeResponse
-	if err := json.Unmarshal(line, &response); err != nil {
-		r.drop()
+	if err := decodeIMEFrame(line, response); err != nil {
 		return fmt.Errorf("invalid IME ACK: %w", err)
 	}
-	if !response.OK {
-		r.drop()
-		return fmt.Errorf("IME service rejected %s: %s", request.Op, response.Error)
-	}
-	if response.Generation == 0 || response.Session == "" {
-		r.drop()
-		return errors.New("IME service returned incomplete ACK")
-	}
 	return nil
+}
+
+func (r *imeReporter) connect() error {
+	if err := validateIMESocket(r.path); err != nil {
+		if r.openParams != nil {
+			return fmt.Errorf("HERDR_IME_INTENT_INVALID: %w", err)
+		}
+		return err
+	}
+	conn, err := net.DialTimeout("unix", r.path, time.Second)
+	if err != nil {
+		return fmt.Errorf("connect IME transport: %w", err)
+	}
+	r.conn = conn
+	r.reader = bufio.NewReaderSize(conn, 4096)
+	if err := conn.SetDeadline(time.Now().Add(4 * time.Second)); err != nil {
+		return err
+	}
+	if r.openParams == nil {
+		return nil
+	}
+	request := struct {
+		ID     string            `json:"id"`
+		Method string            `json:"method"`
+		Params map[string]string `json:"params"`
+	}{"ime:open", "pane.input_intent.stream", r.openParams}
+	var response imeOpenResponse
+	if err := r.transact(request, &response); err != nil {
+		return err
+	}
+	if response.ID != "ime:open" || response.Error != nil || response.Result == nil {
+		return errors.New("Herdr rejected or mismatched input intent stream open")
+	}
+	result := response.Result
+	if result.Type != "pane_input_intent_stream_opened" || result.Session == "" || result.Generation == 0 {
+		return errors.New("Herdr returned incomplete input intent stream open")
+	}
+	r.session, r.generation = result.Session, result.Generation
+	return nil
+}
+
+// exchange is called only under mu. Inactive is a successful background
+// declaration, not authorization; pending is valid only for a direct blur.
+func (r *imeReporter) exchange(request imeRequest) (scope string, err error) {
+	if r.failure != nil {
+		return "", r.failure
+	}
+	defer func() {
+		if err != nil {
+			r.failure = err
+			r.drop()
+		}
+	}()
+	if r.conn == nil {
+		if err = r.connect(); err != nil {
+			return "", err
+		}
+	}
+	if err = r.conn.SetDeadline(time.Now().Add(4 * time.Second)); err != nil {
+		return "", err
+	}
+	var response imeResponse
+	if err = r.transact(request, &response); err != nil {
+		return "", err
+	}
+	if !response.OK {
+		return "", fmt.Errorf("IME service rejected %s: %s", request.Op, response.Error)
+	}
+	if response.Error != "" || response.Generation == 0 || response.Session == "" ||
+		(r.session != "" && response.Session != r.session) || response.Generation < r.generation {
+		return "", errors.New("IME service returned incomplete or stale ACK identity")
+	}
+	if r.openParams != nil {
+		if response.Scope != "recorded" {
+			return "", errors.New("Herdr ACK must have recorded scope")
+		}
+	} else if response.Scope != "applied" && response.Scope != "inactive" &&
+		!(response.Scope == "pending" && request.Op == "blur") {
+		return "", errors.New("invalid direct IME ACK scope")
+	}
+	r.session, r.generation = response.Session, response.Generation
+	return response.Scope, nil
 }
 
 func (r *imeReporter) drop() {
@@ -117,36 +233,85 @@ func (r *imeReporter) drop() {
 	r.active = false
 }
 
-func (r *imeReporter) report(state string) error {
+// startEpisode explicitly reasserts the current classifier on startup/focus,
+// even if a missing reporter blur left our local active flag stale.
+func (r *imeReporter) startEpisode(state string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.startEpisodeLocked(state, false)
+}
+
+func (r *imeReporter) key(state string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.startEpisodeLocked(state, true)
+}
+
+func (r *imeReporter) startEpisodeLocked(state string, realKey bool) error {
 	if r.closed || r.suspended {
 		return nil
 	}
-	if !r.active {
-		if err := r.exchange(imeRequest{Op: "activate", State: state, Policy: "mode"}); err != nil {
-			return err
+	if r.failure != nil {
+		return r.failure
+	}
+	if realKey && r.openParams != nil && r.active {
+		if r.reader.Buffered() != 0 {
+			r.failure = errors.New("unsolicited data on Herdr IME intent stream")
+			r.drop()
+			return r.failure
 		}
-		r.active = true
-	} else if r.state != state {
-		if err := r.exchange(imeRequest{Op: "state", State: state}); err != nil {
-			return err
+		if err := checkIMESocketAlive(r.conn); err != nil {
+			r.failure = fmt.Errorf("Herdr IME intent stream disconnected: %w", err)
+			r.drop()
+			return r.failure
 		}
-	} else {
+		return r.reportLocked(state)
+	}
+	request := imeRequest{Op: "activate", State: state, Policy: "mode"}
+	if (r.resumeRequired && r.declared) || (realKey && r.openParams == nil && r.active) {
+		request = imeRequest{Op: "resume", State: state}
+	}
+	scope, err := r.exchange(request)
+	if err != nil {
+		return err
+	}
+	r.declared = true
+	r.state = state
+	r.active = scope == "applied" || scope == "recorded"
+	r.resumeRequired = false
+	return nil
+}
+
+func (r *imeReporter) report(state string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reportLocked(state)
+}
+
+func (r *imeReporter) reportLocked(state string) error {
+	if r.failure != nil {
+		return r.failure
+	}
+	if r.closed || r.suspended || !r.active || r.state == state {
 		return nil
 	}
+	scope, err := r.exchange(imeRequest{Op: "state", State: state})
+	if err != nil {
+		return err
+	}
 	r.state = state
+	r.active = scope == "applied" || scope == "recorded"
 	return nil
 }
 
 func (r *imeReporter) blur() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.active || r.closed || r.suspended {
+	if r.closed || r.suspended || !r.declared {
 		return nil
 	}
-	err := r.exchange(imeRequest{Op: "blur"})
 	r.active = false
+	_, err := r.exchange(imeRequest{Op: "blur"})
 	return err
 }
 
@@ -156,49 +321,29 @@ func (r *imeReporter) suspend() error {
 	if r.closed || r.suspended {
 		return nil
 	}
-	r.suspendInactive = !r.active
-	r.suspended = true
-	if r.active {
-		if err := r.exchange(imeRequest{Op: "suspend"}); err != nil {
-			r.suspended = false
-			r.suspendInactive = false
+	r.active = false
+	if r.declared {
+		if _, err := r.exchange(imeRequest{Op: "suspend"}); err != nil {
 			return err
 		}
 	}
-	r.active = false
+	r.suspended = true
+	r.resumeRequired = true
 	return nil
 }
 
-func (r *imeReporter) resume(state string) error {
+// Child completion restores eligibility, not ownership. The next real key or
+// focus episode explicitly resumes the parent with its then-current classifier.
+func (r *imeReporter) finishSuspension() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || !r.suspended {
-		return nil
-	}
-	op := "resume"
-	if r.conn == nil || r.suspendInactive {
-		// A broken or already-blurred lease must activate a new owner.
-		op = "activate"
-	}
-	request := imeRequest{Op: op, State: state}
-	if op == "activate" {
-		request.Policy = "mode"
-	}
-	if err := r.exchange(request); err != nil {
-		r.suspended = false
-		return err
-	}
-	r.state = state
-	r.active = true
 	r.suspended = false
-	r.suspendInactive = false
-	return nil
 }
 
-func (r *imeReporter) isSuspended() bool {
+func (r *imeReporter) isActive() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.suspended
+	return r.active && !r.suspended && !r.closed
 }
 
 func (r *imeReporter) close() error {
@@ -210,26 +355,25 @@ func (r *imeReporter) close() error {
 	r.closed = true
 	var err error
 	if r.conn != nil {
-		err = r.exchange(imeRequest{Op: "close"})
+		_, err = r.exchange(imeRequest{Op: "close"})
 	}
 	r.drop()
 	return err
 }
 
-// EnableTUIIME is called only by the interactive program path. Robot, version
-// and debug-render paths never create or contact an IME client.
+// EnableTUIIME is called only by the interactive program path. Herdr transport
+// selection precedes ordinary SSH/GUI exclusions in the program entrypoint.
 func (m *Model) EnableTUIIME() error {
-	path, err := localIMESocket()
+	reporter, err := selectIMEReporter()
 	if err != nil {
 		return err
 	}
-	m.imeReporter = newIMEReporter(path)
-	m.imeFocused = true
-	// Obtain the command-mode ACK before entering Bubble Tea's input loop.
-	return m.imeReporter.report(m.imeState())
+	m.imeReporter = reporter
+	m.startIMEEpisode()
+	return m.IMEFailure()
 }
 
-// IMEFailure reports why the interactive TUI stopped without a protected mode.
+// IMEFailure reports a transport/protocol failure, not normal background focus.
 func (m *Model) IMEFailure() error {
 	if m.imeWarning != "" {
 		return errors.New(m.imeWarning)
@@ -256,9 +400,26 @@ func (m *Model) noteIMEError(err error) {
 	}
 }
 
+func (m *Model) startIMEEpisode() {
+	if m.imeReporter != nil {
+		m.noteIMEError(m.imeReporter.startEpisode(m.imeState()))
+		m.imeFocused = m.imeReporter.isActive()
+	}
+}
+
+func (m *Model) prepareIMEKey() {
+	if m.imeReporter != nil {
+		// A daemon can pause focus without an app notification. A genuine key
+		// rechecks/resumes the same local owner, without activate's snapshot churn.
+		m.noteIMEError(m.imeReporter.key(m.imeState()))
+		m.imeFocused = m.imeReporter.isActive()
+	}
+}
+
 func (m *Model) reportIME() {
-	if m.imeReporter != nil && m.imeFocused && !m.imeReporter.isSuspended() {
+	if m.imeReporter != nil && m.imeFocused {
 		m.noteIMEError(m.imeReporter.report(m.imeState()))
+		m.imeFocused = m.imeReporter.isActive()
 	}
 }
 

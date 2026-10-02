@@ -9,7 +9,7 @@
 
 ## `custom/ime-reporter`：本地图形终端输入法
 
-此分支基于上游 `Dicklesworthstone/beads_viewer` 的 v0.25.0，保持 `upstream` 跟踪。仅交互式 TUI 在本地图形会话向用户级 `ime-control` Unix socket 上报命令/文本态、焦点、editor 暂停与退出；输入源采样、切换和恢复都由服务负责。list 过滤、board/History 搜索及 label/time-travel 输入框属于文本态，board 搜索接受中文 Unicode 字符。`--robot-*` 和版本查询不接触服务；服务不可用或切换失败会报错并终止 TUI，不继续处理未受保护的命令键。受管目标本地从固定源码提交构建，并以 `-ldflags '-X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v0.25.0-custom.1'` 区分原版。
+此分支基于上游 `Dicklesworthstone/beads_viewer` 的 v0.25.0，保持 `upstream` 跟踪。交互式 TUI 上报命令／文本态、焦点、editor 暂停与退出；输入源采样、切换和恢复由本机 `ime-control` 负责。list 过滤、board/History 搜索及 label/time-travel 输入框属于文本态，board 搜索接受中文 Unicode；text 释放暂态英文而不强制中文。无 marker 时仅本地图形会话建立直接 lease，命令键等待 `scope:applied` ACK；服务不可用或切换失败报错并终止 TUI。`HERDR_IME_INTENT=1` 与 `HERDR_ENV=1` 先于 GUI/SSH 判定选择 `pane.input_intent.stream`，要求可信 server socket 及互斥 pane/Popup identity，非法 marker 不回退。server 的 `scope:recorded` 不证明本机切源，聚焦 Herdr client 独立等待 applied ACK；两端 `[experimental].ime_control` 默认关闭。editor 返回或 SIGCONT 不自动夺回所有权，下一个真实 key/FocusIn 才恢复当前 classifier。`--robot-*` 和版本查询不接触服务。受管目标本地从固定提交构建，以 `-ldflags '-X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v0.25.0-custom.1'` 区分原版；源码候选尚非部署／GUI 验收证据。
 
 <div align="center" style="margin: 1.2em 0;">
   <table>

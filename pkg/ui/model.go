@@ -2237,6 +2237,28 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 		}
 	}
 
+	// Only real terminal input can start a new focus episode after an inactive
+	// ACK. Sample the classifier before dispatch, not a previously cached mode.
+	if key, realKey := msg.(tea.KeyMsg); realKey {
+		if key.Type == tea.KeyCtrlZ {
+			if m.imeReporter != nil {
+				m.noteIMEError(m.imeReporter.suspend())
+				m.imeFocused = false
+				if m.IMEFailure() != nil {
+					return m, tea.Quit
+				}
+			}
+			return m, tea.Suspend
+		}
+		m.prepareIMEKey()
+		if m.IMEFailure() != nil {
+			return m, tea.Quit
+		}
+		if m.imeReporter != nil && !m.imeFocused {
+			return m, nil
+		}
+	}
+
 	switch msg := msg.(type) {
 	case tea.BlurMsg:
 		m.imeFocused = false
@@ -2246,11 +2268,13 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 		return m, nil
 
 	case tea.FocusMsg:
+		m.startIMEEpisode()
+		return m, nil
+
+	case tea.ResumeMsg:
 		if m.imeReporter != nil {
-			m.imeFocused = true
-			if m.imeReporter.isSuspended() {
-				m.noteIMEError(m.imeReporter.resume(m.imeState()))
-			}
+			m.imeReporter.finishSuspension()
+			m.imeFocused = false
 		}
 		return m, nil
 
@@ -2395,8 +2419,9 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 		return m, tea.Batch(cmd, m.pendingSemanticFilterCmd())
 
 	case editorExitMsg:
-		if m.imeReporter != nil && m.imeFocused {
-			m.noteIMEError(m.imeReporter.resume(m.imeState()))
+		if m.imeReporter != nil {
+			m.imeReporter.finishSuspension()
+			m.imeFocused = false
 		}
 		// Terminal editor exited — parse changes and apply via br update (bv-134)
 		defer os.Remove(msg.tmpFile)
@@ -10178,7 +10203,7 @@ func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
 	m.statusMsg = fmt.Sprintf("📝 Opening %s in %s...", issue.ID, filepath.Base(editorArgs[0]))
 	m.statusIsError = false
 	if m.imeReporter != nil {
-		// Do not hand the terminal to an editor until the daemon confirms release.
+		// Confirm release (or intent suspension in Herdr) before editor handoff.
 		if err := m.imeReporter.suspend(); err != nil {
 			m.noteIMEError(err)
 			os.Remove(tmpPath)
