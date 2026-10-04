@@ -787,7 +787,7 @@ type Model struct {
 	embeddedTextInputSession embeddedTextInputSession
 	imeReporter              *imeReporter // TUI-only lease; absent for robot/render paths
 	imeFocused               bool
-	imeWarning               string
+	imeDisabled              bool
 	embeddedTextInputGen     uint64
 	isSplitView              bool
 	splitPaneRatio           float64 // Ratio of list pane width (0.2-0.8), default 0.4
@@ -2066,9 +2066,6 @@ func (m *Model) rebuildInsightsPanel() {
 
 func (m *Model) Init() tea.Cmd {
 	m.reportIME()
-	if m.IMEFailure() != nil {
-		return tea.Quit
-	}
 	// Note: ReadyTimeoutCmd is no longer needed since the model is now
 	// initialized as ready with default dimensions in NewModel().
 	// This eliminates the "Initializing..." phase entirely.
@@ -2220,13 +2217,9 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 				m.statusMsg = m.cassRequest.status
 			}
 		}
-		// A named return covers every early return, including the nested worker
-		// route. No following command key can run after an ACK failure.
+		// A named return reports classifier changes on every UI route.
 		if m.imeFocused && m.imeReporter != nil {
 			m.reportIME()
-		}
-		if m.IMEFailure() != nil {
-			command = tea.Quit
 		}
 	}()
 
@@ -2244,16 +2237,10 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 			if m.imeReporter != nil {
 				m.noteIMEError(m.imeReporter.suspend())
 				m.imeFocused = false
-				if m.IMEFailure() != nil {
-					return m, tea.Quit
-				}
 			}
 			return m, tea.Suspend
 		}
 		m.prepareIMEKey()
-		if m.IMEFailure() != nil {
-			return m, tea.Quit
-		}
 		if m.imeReporter != nil && !m.imeFocused {
 			return m, nil
 		}
@@ -7372,9 +7359,6 @@ func (m *Model) renderFooter() string {
 	// POLISHED FOOTER - Stripe-level status bar with visual hierarchy
 	// ══════════════════════════════════════════════════════════════════════════
 
-	if m.imeWarning != "" {
-		return lipgloss.NewStyle().Foreground(ColorPrioCritical).Render("✗ " + m.imeWarning)
-	}
 	// If there's a status message, show it prominently with polished styling
 	if m.statusMsg != "" {
 		var msgStyle lipgloss.Style
@@ -10203,12 +10187,9 @@ func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
 	m.statusMsg = fmt.Sprintf("📝 Opening %s in %s...", issue.ID, filepath.Base(editorArgs[0]))
 	m.statusIsError = false
 	if m.imeReporter != nil {
-		// Confirm release (or intent suspension in Herdr) before editor handoff.
-		if err := m.imeReporter.suspend(); err != nil {
-			m.noteIMEError(err)
-			os.Remove(tmpPath)
-			return nil
-		}
+		// Release enhanced ownership before handoff; failure disables only IME.
+		m.noteIMEError(m.imeReporter.suspend())
+		m.imeFocused = false
 	}
 
 	return tea.ExecProcess(editorCmd, func(err error) tea.Msg {

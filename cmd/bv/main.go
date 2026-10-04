@@ -4556,11 +4556,10 @@ func runTUIProgram(m *ui.Model) error {
 		(runtime.GOOS == "darwin" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "")
 	_, herdrIME := os.LookupEnv("HERDR_IME_INTENT")
 	if herdrIME || localGUI {
-		if err := m.EnableTUIIME(); err != nil {
-			return fmt.Errorf("bv: IME command mode unavailable: %w", err)
-		}
+		_ = m.EnableTUIIME()
 	}
-	defer m.CloseIME()
+	closeIME := m.IMEShutdown()
+	defer closeIME()
 	p := tea.NewProgram(
 		m,
 		tea.WithAltScreen(),
@@ -4582,7 +4581,7 @@ func runTUIProgram(m *ui.Model) error {
 			return
 		case <-sigCh:
 		}
-		m.CloseIME()
+		closeIME()
 
 		p.Quit()
 
@@ -4625,9 +4624,6 @@ func runTUIProgram(m *ui.Model) error {
 	_, err := p.Run()
 	if err != nil && !errors.Is(err, tea.ErrProgramKilled) && !errors.Is(err, tea.ErrInterrupted) {
 		return err
-	}
-	if err := m.IMEFailure(); err != nil {
-		return fmt.Errorf("bv: %w", err)
 	}
 	return nil
 }

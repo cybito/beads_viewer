@@ -20,7 +20,6 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
-	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 	flag "github.com/spf13/pflag"
 )
 
@@ -2693,28 +2692,4 @@ func fingerprintConfigDir(configDir string) string {
 		return nil
 	})
 	return out
-}
-
-func TestHerdrIMEMarkerRejectsBeforeSSHHeadlessBypass(t *testing.T) {
-	t.Setenv("SSH_CONNECTION", "fixture remote")
-	t.Setenv("SSH_CLIENT", "fixture remote")
-	t.Setenv("SSH_TTY", "/dev/pts/fixture")
-	t.Setenv("TERM", "dumb")
-	t.Setenv("DISPLAY", "")
-	t.Setenv("WAYLAND_DISPLAY", "")
-	t.Setenv("HERDR_ENV", "1")
-	t.Setenv("HERDR_PANE_ID", "fixture")
-	t.Setenv("HERDR_IME_POPUP_TERMINAL_ID", "")
-	t.Setenv("HERDR_SOCKET_PATH", "unsafe-relative.sock")
-	for _, marker := range []string{"", "unsupported", "1"} {
-		t.Run(fmt.Sprintf("marker=%q", marker), func(t *testing.T) {
-			t.Setenv("HERDR_IME_INTENT", marker)
-			m := ui.NewModel(nil, nil, "")
-			defer m.Stop()
-			err := runTUIProgram(m)
-			if err == nil || !strings.Contains(err.Error(), "HERDR_IME_INTENT_") {
-				t.Fatalf("enabled unsafe Herdr TUI silently took ordinary SSH/headless bypass: %v", err)
-			}
-		})
-	}
 }

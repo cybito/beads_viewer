@@ -2,9 +2,11 @@ package ui
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -140,7 +142,7 @@ func TestTUIIMETransitionsWaitForACK(t *testing.T) {
 	}
 }
 
-func TestTUIIMEFailureQuitsBeforeAnotherCommandKey(t *testing.T) {
+func TestTUIIMEFailureDisablesReporterAndDispatchesCurrentKey(t *testing.T) {
 	path, listener := imeTestListener(t)
 	serverDone := make(chan error, 1)
 	go func() {
@@ -174,18 +176,24 @@ func TestTUIIMEFailureQuitsBeforeAnotherCommandKey(t *testing.T) {
 	m.startIMEEpisode()
 	m.Init()
 	_, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
-	if m.IMEFailure() == nil {
-		t.Fatal("backend rejection must not leave the TUI in an unprotected mode")
+	if !m.imeDisabled || m.imeReporter != nil || m.imeFocused {
+		t.Fatal("backend rejection must disable IME without claiming protection")
 	}
-	if m.list.FilterState() == list.Filtering {
-		t.Fatal("command key was dispatched before its rejected source ACK")
+	if m.list.FilterState() != list.Filtering {
+		t.Fatal("backend rejection swallowed the current search key")
 	}
-	if command == nil {
-		t.Fatal("backend rejection must terminate the TUI before another key")
+	if command != nil {
+		if _, ok := command().(tea.QuitMsg); ok {
+			t.Fatal("optional IME failure requested quit")
+		}
 	}
-	if _, ok := command().(tea.QuitMsg); !ok {
-		t.Fatal("backend rejection did not request Bubble Tea quit")
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("中")})
+	if m.list.FilterValue() != "中" {
+		t.Fatal("ordinary text input stopped after IME failure")
 	}
+	m.Update(tea.FocusMsg{})
+	m.Update(tea.ResumeMsg{})
+	m.CloseIME()
 	select {
 	case err := <-serverDone:
 		if err != nil {
@@ -407,8 +415,8 @@ func TestTUIIMEInactiveWaitsForRealKeyAndCurrentClassifier(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
 	expectIMEEvent(t, events, "resume", "command")
 	expectIMEEvent(t, events, "state", "text")
-	if m.IMEFailure() != nil || m.imeFocused || m.list.FilterState() != list.Filtering {
-		t.Fatalf("inactive transition lost UI state or claimed authorization: failure=%v focus=%v filter=%v", m.IMEFailure(), m.imeFocused, m.list.FilterState())
+	if m.imeDisabled || m.imeFocused || m.list.FilterState() != list.Filtering {
+		t.Fatalf("inactive transition lost UI state or claimed authorization: disabled=%v focus=%v filter=%v", m.imeDisabled, m.imeFocused, m.list.FilterState())
 	}
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m.Update(embeddedTextInputMsg{})
@@ -433,8 +441,8 @@ func TestTUIIMEInactiveCommandDoesNotDispatchOrQuit(t *testing.T) {
 	expectIMEEvent(t, events, "activate", "command")
 	_, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
 	expectIMEEvent(t, events, "activate", "command")
-	if m.IMEFailure() != nil || command != nil || m.focused == focusBoard || m.imeFocused {
-		t.Fatalf("inactive command was dispatched, authorized or fatal: failure=%v command=%v focus=%v", m.IMEFailure(), command != nil, m.focused)
+	if m.imeDisabled || command != nil || m.focused == focusBoard || m.imeFocused {
+		t.Fatalf("inactive command was dispatched, authorized or fatal: disabled=%v command=%v focus=%v", m.imeDisabled, command != nil, m.focused)
 	}
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	noIMEEvent(t, events)
@@ -525,10 +533,18 @@ func TestHerdrIMERejectsInvalidLaunchWithoutDirectFallback(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			m := NewModel(nil, nil, "")
+			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
 			defer m.Stop()
-			if err := m.EnableTUIIME(); err == nil || !strings.Contains(err.Error(), "HERDR_IME_INTENT_") {
-				t.Fatalf("unsafe enabled launch did not explicitly refuse transport: %v", err)
+			if err := m.EnableTUIIME(); err != nil || !m.imeDisabled || m.imeReporter != nil {
+				t.Fatalf("unsafe launch must disable only optional IME: %v", err)
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+			if m.list.FilterState() != list.Filtering {
+				t.Fatal("invalid marker prevented ordinary search")
+			}
+			m.Update(tea.FocusMsg{})
+			if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
+				t.Fatal("invalid launch retried its reporter")
 			}
 			noIMEEvent(t, events)
 		})
@@ -618,16 +634,20 @@ func TestHerdrIMERejectsIncompleteOpenAndLocalScopes(t *testing.T) {
 				return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":%q}`, generation, session, scope)
 			})
 			setHerdrIMEEnv(t, path)
-			m := NewModel(nil, nil, "")
+			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
 			defer m.Stop()
-			if err := m.EnableTUIIME(); err == nil {
-				t.Fatal("bad open, scope or identity authorized Herdr app intent")
+			if err := m.EnableTUIIME(); err != nil || !m.imeDisabled || m.imeReporter != nil || m.imeFocused {
+				t.Fatal("bad open, scope or identity must disable only optional intent")
 			}
 			expectIMEEvent(t, events, "", "")
 			if scope != "" {
 				expectIMEEvent(t, events, "activate", "command")
 			}
-			if err := m.imeReporter.startEpisode("text"); err == nil {
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+			if m.list.FilterState() != list.Filtering {
+				t.Fatal("rejected stream prevented ordinary search")
+			}
+			if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
 				t.Fatal("bad stream was reopened and replayed")
 			}
 			noIMEEvent(t, events)
@@ -709,7 +729,7 @@ func TestTUIIMEEditorCompletionCannotAcquireInBackground(t *testing.T) {
 	m.Update(editorExitMsg{tmpFile: file.Name(), err: errors.New("editor cancelled")})
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	noIMEEvent(t, events)
-	if m.imeFocused || m.IMEFailure() != nil {
+	if m.imeFocused || m.imeDisabled {
 		t.Fatal("editor completion claimed background command ownership")
 	}
 	m.Update(tea.FocusMsg{})
@@ -732,7 +752,7 @@ func TestTUIIMEPendingBlurDoesNotAuthorizeBackgroundUpdates(t *testing.T) {
 	expectIMEEvent(t, events, "activate", "command")
 	m.Update(tea.BlurMsg{})
 	expectIMEEvent(t, events, "blur", "")
-	if m.IMEFailure() != nil || m.imeFocused || m.imeReporter.isActive() {
+	if m.imeDisabled || m.imeFocused || m.imeReporter.isActive() {
 		t.Fatal("pending blur was fatal or claimed released/command authorization")
 	}
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
@@ -872,7 +892,7 @@ func TestTUIIMERealKeyDiscoversObserverOnlyFocusPause(t *testing.T) {
 	// The daemon observer knows focus was lost; the app received no BlurMsg.
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
 	expectIMEEvent(t, events, "resume", "command")
-	if m.imeFocused || m.IMEFailure() != nil || m.focused == focusBoard {
+	if m.imeFocused || m.imeDisabled || m.focused == focusBoard {
 		t.Fatal("cached authorization survived an inactive real-key focus check")
 	}
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
@@ -886,7 +906,7 @@ func TestTUIIMERealKeyDiscoversObserverOnlyFocusPause(t *testing.T) {
 	expectIMEEvent(t, events, "close", "")
 }
 
-func TestHerdrIMECoalescedKeyRejectsEOFBeforeUICommand(t *testing.T) {
+func TestHerdrIMECoalescedKeyDisablesEOFAndContinuesUICommand(t *testing.T) {
 	path, listener := imeTestListener(t)
 	setHerdrIMEEnv(t, path)
 	serverDone := make(chan error, 1)
@@ -932,16 +952,209 @@ func TestHerdrIMECoalescedKeyRejectsEOFBeforeUICommand(t *testing.T) {
 		t.Fatal("fixture did not close its intent stream")
 	}
 	_, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
-	if m.IMEFailure() == nil || m.imeFocused || m.focused == focusBoard {
-		t.Fatal("unchanged cached intent authorized a UI command after stream EOF")
+	if !m.imeDisabled || m.imeReporter != nil || m.imeFocused || m.focused != focusBoard {
+		t.Fatal("stream EOF must disable IME and continue ordinary board navigation")
 	}
-	if command == nil {
-		t.Fatal("stream EOF did not explicitly terminate the unprotected local TUI")
+	if command != nil {
+		if _, ok := command().(tea.QuitMsg); ok {
+			t.Fatal("stream EOF requested Bubble Tea quit")
+		}
 	}
-	if _, ok := command().(tea.QuitMsg); !ok {
-		t.Fatal("stream EOF did not request Bubble Tea quit")
+	m.Update(tea.FocusMsg{})
+	m.Update(tea.ResumeMsg{})
+	if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
+		t.Fatal("disabled stream was reopened")
 	}
-	if err := m.imeReporter.key("command"); err == nil {
-		t.Fatal("closed stream replayed an old command mode")
+}
+
+func TestTUIIMEStartupMissingContinuesWithoutReplay(t *testing.T) {
+	path, events := imeTestServer(t, true, "", nil)
+	setHerdrIMEEnv(t, filepath.Join(filepath.Dir(path), "missing.sock"))
+	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
+	defer m.Stop()
+	if err := m.EnableTUIIME(); err != nil || !m.imeDisabled || m.imeReporter != nil {
+		t.Fatal("missing component must disable optional reporter")
 	}
+	m.Init()
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("中")})
+	if m.list.FilterState() != list.Filtering || m.list.FilterValue() != "中" {
+		t.Fatal("missing component prevented ordinary search")
+	}
+	// Even a now-valid transport must not revive old process intent.
+	t.Setenv("HERDR_SOCKET_PATH", path)
+	m.Update(tea.FocusMsg{})
+	m.Update(tea.ResumeMsg{})
+	if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
+		t.Fatal("disabled startup reporter retried")
+	}
+	m.CloseIME()
+	noIMEEvent(t, events)
+}
+
+func TestTUIIMERejectedLifecycleRemainsOptional(t *testing.T) {
+	for _, op := range []string{"activate", "state", "blur", "suspend", "close"} {
+		t.Run(op, func(t *testing.T) {
+			path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+				if request.Op == op {
+					return fmt.Sprintf(`{"ok":false,"generation":%d,"error":"FOCUS_UNAVAILABLE"}`, generation)
+				}
+				return ""
+			})
+			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
+			defer m.Stop()
+			r := newIMEReporter(path)
+			m.imeReporter = r
+			m.startIMEEpisode()
+			expectIMEEvent(t, events, "activate", "command")
+			switch op {
+			case "state":
+				m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+				expectIMEEvent(t, events, "resume", "command")
+				expectIMEEvent(t, events, "state", "text")
+				if m.list.FilterState() != list.Filtering {
+					t.Fatal("rejected state lost current search transition")
+				}
+			case "blur":
+				m.Update(tea.BlurMsg{})
+				expectIMEEvent(t, events, "blur", "")
+			case "suspend":
+				_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
+				expectIMEEvent(t, events, "suspend", "")
+				if cmd == nil {
+					t.Fatal("IME rejection prevented terminal suspension")
+				}
+				if _, ok := cmd().(tea.SuspendMsg); !ok {
+					t.Fatal("IME rejection replaced suspension")
+				}
+			case "close":
+				m.CloseIME()
+				expectIMEEvent(t, events, "close", "")
+			}
+			if !m.imeDisabled || m.imeReporter != nil || m.imeFocused || r.isActive() || r.state != "" || r.conn != nil {
+				t.Fatal("failure retained live or cached reporter intent")
+			}
+			m.Update(tea.FocusMsg{})
+			m.Update(tea.ResumeMsg{})
+			if m.list.FilterState() == list.Filtering {
+				m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+			if m.focused != focusBoard {
+				t.Fatal("lifecycle rejection prevented ordinary navigation")
+			}
+			m.CloseIME()
+			noIMEEvent(t, events)
+		})
+	}
+}
+
+type imeEditorProgram struct {
+	*Model
+	command tea.Cmd
+	exited  bool
+	err     error
+}
+
+func (m *imeEditorProgram) Init() tea.Cmd { return m.command }
+
+func (m *imeEditorProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	_, command := m.Model.Update(msg)
+	if result, ok := msg.(editorExitMsg); ok {
+		m.exited, m.err = true, result.err
+		return m, tea.Quit
+	}
+	return m, command
+}
+
+func TestTUIIMERejectedEditorHandoffRunsChildAndRecovers(t *testing.T) {
+	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+		if request.Op == "suspend" {
+			return `{"ok":false,"generation":2,"error":"BACKEND_UNAVAILABLE"}`
+		}
+		return ""
+	})
+	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
+	defer m.Stop()
+	m.imeReporter = newIMEReporter(path)
+	m.startIMEEpisode()
+	expectIMEEvent(t, events, "activate", "command")
+	marker := filepath.Join(t.TempDir(), "child-ran")
+	command := m.launchTerminalEditor([]string{"/bin/sh", "-c", `printf child > "$1"`, "editor-fixture", marker})
+	expectIMEEvent(t, events, "suspend", "")
+	if command == nil || !m.imeDisabled || m.imeReporter != nil || m.imeFocused {
+		t.Fatal("rejected IME handoff prevented child dispatch or retained protection")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	programModel := &imeEditorProgram{Model: m, command: command}
+	program := tea.NewProgram(programModel, tea.WithContext(ctx), tea.WithInput(strings.NewReader("")), tea.WithOutput(io.Discard), tea.WithoutRenderer(), tea.WithoutSignalHandler())
+	if _, err := program.Run(); err != nil {
+		t.Fatalf("ordinary child lifecycle failed: %v", err)
+	}
+	content, err := os.ReadFile(marker)
+	if err != nil || string(content) != "child" || !programModel.exited || programModel.err != nil {
+		t.Fatalf("child did not run and return: content=%q read=%v exit=%v child=%v", content, err, programModel.exited, programModel.err)
+	}
+	m.Update(tea.FocusMsg{})
+	m.Update(tea.ResumeMsg{})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if m.focused != focusBoard || m.imeReporter != nil {
+		t.Fatal("editor recovery blocked ordinary navigation or replayed IME")
+	}
+	noIMEEvent(t, events)
+}
+
+func TestTUIIMESignalCloseFailureConcurrentWithInputAndFocus(t *testing.T) {
+	rejectClose := make(chan struct{})
+	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+		if request.Op == "close" {
+			<-rejectClose
+			return fmt.Sprintf(`{"ok":false,"generation":%d,"error":"BACKEND_UNAVAILABLE"}`, generation)
+		}
+		return ""
+	})
+	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
+	defer m.Stop()
+	r := newIMEReporter(path)
+	m.imeReporter = r
+	m.startIMEEpisode()
+	expectIMEEvent(t, events, "activate", "command")
+	shutdown := m.IMEShutdown()
+	signalDone := make(chan struct{})
+	go func() {
+		shutdown()
+		close(signalDone)
+	}()
+	expectIMEEvent(t, events, "close", "")
+	// The signal shutdown holds the reporter mutex while the UI's next
+	// genuine key/focus episode attempts to inspect the same reporter.
+	uiStarted, uiDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		close(uiStarted)
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("中")})
+		m.Update(tea.FocusMsg{})
+		m.Update(tea.ResumeMsg{})
+		close(uiDone)
+	}()
+	<-uiStarted
+	close(rejectClose)
+	for _, done := range []<-chan struct{}{signalDone, uiDone} {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("concurrent signal shutdown/UI lifecycle did not finish")
+		}
+	}
+	if !m.imeDisabled || m.imeReporter != nil || m.imeFocused || r.isActive() {
+		t.Fatal("signal close failure retained reporter authorization")
+	}
+	if m.list.FilterState() != list.Filtering || m.list.FilterValue() != "中" {
+		t.Fatal("signal close failure swallowed current input")
+	}
+	// Repeated shutdown still addresses the captured identity after the UI
+	// owner has removed its optional reporter; it must not access Model state.
+	shutdown()
+	noIMEEvent(t, events)
 }

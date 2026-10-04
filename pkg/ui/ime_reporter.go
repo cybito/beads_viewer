@@ -231,6 +231,9 @@ func (r *imeReporter) drop() {
 	r.conn = nil
 	r.reader = nil
 	r.active = false
+	r.declared = false
+	r.state = ""
+	r.resumeRequired = false
 }
 
 // startEpisode explicitly reasserts the current classifier on startup/focus,
@@ -248,11 +251,11 @@ func (r *imeReporter) key(state string) error {
 }
 
 func (r *imeReporter) startEpisodeLocked(state string, realKey bool) error {
-	if r.closed || r.suspended {
-		return nil
-	}
 	if r.failure != nil {
 		return r.failure
+	}
+	if r.closed || r.suspended {
+		return nil
 	}
 	if realKey && r.openParams != nil && r.active {
 		if r.reader.Buffered() != 0 {
@@ -364,20 +367,16 @@ func (r *imeReporter) close() error {
 // EnableTUIIME is called only by the interactive program path. Herdr transport
 // selection precedes ordinary SSH/GUI exclusions in the program entrypoint.
 func (m *Model) EnableTUIIME() error {
+	if m.imeDisabled || m.imeReporter != nil {
+		return nil
+	}
 	reporter, err := selectIMEReporter()
 	if err != nil {
-		return err
+		m.imeDisabled = true
+		return nil
 	}
 	m.imeReporter = reporter
 	m.startIMEEpisode()
-	return m.IMEFailure()
-}
-
-// IMEFailure reports a transport/protocol failure, not normal background focus.
-func (m *Model) IMEFailure() error {
-	if m.imeWarning != "" {
-		return errors.New(m.imeWarning)
-	}
 	return nil
 }
 
@@ -394,16 +393,22 @@ func (m *Model) imeState() string {
 
 func (m *Model) noteIMEError(err error) {
 	if err != nil {
-		m.imeWarning = "IME mode unprotected: " + err.Error()
-	} else {
-		m.imeWarning = ""
+		// Transport validation remains strict; only the optional enhancement
+		// stops. Never reconnect or replay this process's previous intent.
+		m.imeDisabled = true
+		m.imeFocused = false
+		if m.imeReporter != nil {
+			_ = m.imeReporter.close()
+			m.imeReporter = nil
+		}
 	}
 }
 
 func (m *Model) startIMEEpisode() {
 	if m.imeReporter != nil {
-		m.noteIMEError(m.imeReporter.startEpisode(m.imeState()))
+		err := m.imeReporter.startEpisode(m.imeState())
 		m.imeFocused = m.imeReporter.isActive()
+		m.noteIMEError(err)
 	}
 }
 
@@ -411,23 +416,36 @@ func (m *Model) prepareIMEKey() {
 	if m.imeReporter != nil {
 		// A daemon can pause focus without an app notification. A genuine key
 		// rechecks/resumes the same local owner, without activate's snapshot churn.
-		m.noteIMEError(m.imeReporter.key(m.imeState()))
+		err := m.imeReporter.key(m.imeState())
 		m.imeFocused = m.imeReporter.isActive()
+		m.noteIMEError(err)
 	}
 }
 
 func (m *Model) reportIME() {
 	if m.imeReporter != nil && m.imeFocused {
-		m.noteIMEError(m.imeReporter.report(m.imeState()))
+		err := m.imeReporter.report(m.imeState())
 		m.imeFocused = m.imeReporter.isActive()
+		m.noteIMEError(err)
 	}
 }
 
-// CloseIME releases the lease synchronously, including from signal shutdown.
+// CloseIME is called only by the model's lifecycle owner.
 func (m *Model) CloseIME() {
 	if m.imeReporter != nil {
-		if err := m.imeReporter.close(); err != nil {
-			fmt.Fprintln(os.Stderr, "bv: IME close:", err)
+		m.noteIMEError(m.imeReporter.close())
+		m.imeFocused = false
+	}
+}
+
+// IMEShutdown captures the reporter before the program starts. Signal handlers
+// may call the returned function concurrently: it touches only the reporter's
+// synchronized lifecycle, never the Model's UI-owned pointer or flags.
+func (m *Model) IMEShutdown() func() {
+	reporter := m.imeReporter
+	return func() {
+		if reporter != nil {
+			_ = reporter.close()
 		}
 	}
 }
