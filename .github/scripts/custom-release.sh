@@ -1,37 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ${1:-} == setup-oras ]]; then
-  platform=$2
-  [[ $platform == linux || $platform == darwin ]] || exit 2
-  dest="$RUNNER_TEMP/oras-$platform"
-  mkdir -p "$dest"
-  file="oras_1.3.3_${platform}_arm64.tar.gz"
-  base=https://github.com/oras-project/oras/releases/download/v1.3.3
-  curl --fail --location --silent --show-error "$base/$file" --output "$dest/$file"
-  curl --fail --location --silent --show-error "$base/oras_1.3.3_checksums.txt" --output "$dest/checksums.txt"
-  python3 - "$dest" "$file" "$ORAS_DARWIN_SHA256" "$ORAS_LINUX_SHA256" "$platform" <<'PY'
-import hashlib, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-expected = sys.argv[3] if sys.argv[5] == 'darwin' else sys.argv[4]
-published = dict((line.split()[1].lstrip('*'), line.split()[0]) for line in (root / 'checksums.txt').read_text().splitlines())
-if published.get(sys.argv[2]) != expected or hashlib.sha256((root / sys.argv[2]).read_bytes()).hexdigest() != expected:
-    raise SystemExit('ORAS pinned/official checksum mismatch')
-PY
-  tar -xzf "$dest/$file" -C "$dest" oras
-  "$dest/oras" version
-  printf '%s\n' "$dest" >> "$GITHUB_PATH"
-  exit
-fi
-
 if [[ ${1:-} == validate-release ]]; then
   python3 - "$GITHUB_EVENT_PATH" <<'PY'
 import json, os, pathlib, re, subprocess, sys
 run = lambda *a: subprocess.check_output(a, text=True).strip()
 event = json.loads(pathlib.Path(sys.argv[1]).read_text())
 release = event['release']
-if event['repository']['full_name'] != 'cybito/beads_viewer' or release['draft'] or release.get('assets') or event.get('action') != 'published':
-    raise SystemExit('not an authorized published release without GitHub assets')
+if event['repository']['full_name'] != 'cybito/beads_viewer' or release['draft'] or event.get('action') != 'published':
+    raise SystemExit('not an authorized published release')
 tag = release['tag_name']
 if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+-custom\.[1-9][0-9]*', tag):
     raise SystemExit('invalid custom release tag')
@@ -53,7 +30,8 @@ fi
 
 if [[ ${1:-} == validation-regressions ]]; then
   python3 - "$(pwd)/.github/scripts/custom-release.sh" <<'PY'
-import json, os, pathlib, subprocess, sys, tempfile
+import hashlib, importlib.util, json, os, pathlib, subprocess, sys, tempfile
+from unittest.mock import patch
 script = sys.argv[1]
 with tempfile.TemporaryDirectory() as tmp:
     root = pathlib.Path(tmp)
@@ -96,50 +74,89 @@ with tempfile.TemporaryDirectory() as tmp:
     if result.returncode == 0:
         raise SystemExit('mismatched checkout was accepted')
 
-# Exercise package boundary logic with isolated receipt bytes and transport failures.
-import importlib.util
-from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('release_package', pathlib.Path(script).with_name('package-release.py'))
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
-for error in (b'MANIFEST_UNKNOWN: manifest unknown', b'NAME_UNKNOWN: unknown name'):
-    response = subprocess.CompletedProcess([], 1, b'', error)
-    with patch.object(package.subprocess, 'run', return_value=response):
-        assert package.fetch(package.PACKAGE + ':absent', pathlib.Path('/anonymous.json')) is None
-for error in (b'UNAUTHORIZED: authentication required', b'connection timed out', b'403 Forbidden'):
-    response = subprocess.CompletedProcess([], 1, b'', error)
-    with patch.object(package.subprocess, 'run', return_value=response):
-        try:
-            package.fetch(package.PACKAGE + ':absent', pathlib.Path('/anonymous.json'))
-        except RuntimeError:
-            pass
-        else:
-            raise SystemExit('transport/authentication error was treated as notfound')
-receipt = package.identity('v0.25.0-custom.1', 'a' * 40, 'linux')
-with patch.object(package, 'fetch', return_value=b'{}'), patch.object(package, 'verify', return_value=receipt):
-    try:
-        package.check('v0.25.0-custom.1', 'b' * 40, 'linux', pathlib.Path('/fixture'), pathlib.Path('/anonymous.json'))
-    except ValueError:
-        pass
-    else:
-        raise SystemExit('conflicting source identity was reused')
+def fixture(root, platform='linux', content=b'archive fixture'):
+    root.mkdir()
+    tag, commit = 'v0.25.0-custom.1', 'a' * 40
+    name = f'bv-{tag}-{platform}-arm64.tar.gz'
+    (root / name).write_bytes(content)
+    receipt = package.identity(tag, commit, platform)
+    receipt.update(toolchains={'go':'go1.26.8'}, files=[{'name':name,'size':len(content),'sha256':hashlib.sha256(content).hexdigest()}])
+    (root / 'release.json').write_text(json.dumps(receipt))
+    (root / 'SHA256SUMS').write_text(''.join(package.hash_file(root / n) + '  ' + n + '\n' for n in sorted([name, 'release.json'])))
+    return receipt
+
+def mocked_download(assets, contents):
+    def download(tag, names, output):
+        output.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (output / name).write_bytes(contents[name])
+    return download
 with tempfile.TemporaryDirectory() as tmp:
     root = pathlib.Path(tmp)
-    name = 'bv-v0.25.0-custom.1-linux-arm64.tar.gz'
-    (root / name).write_bytes(b'archive fixture')
-    receipt.update(toolchains={'go':'go1.26.8'}, files=[{'name':name,'size':15,'sha256':package.hash_bytes(b'archive fixture')}])
-    (root / 'release.json').write_text(json.dumps(receipt))
-    (root / 'SHA256SUMS').write_text(''.join(package.hash_bytes((root / n).read_bytes()) + '  ' + n + '\n' for n in sorted([name, 'release.json'])))
-    assert package.validate(root) == receipt
-    (root / name).write_bytes(b'corrupt archive')
-    try:
-        package.validate(root)
-    except ValueError:
-        pass
-    else:
-        raise SystemExit('corrupt archive was accepted')
+    pkgdir = root / 'package'
+    receipt = fixture(pkgdir)
+    files = package.expected_assets(pkgdir, receipt)
+    records = {name:{'name':name,'size':path.stat().st_size} for name,path in files.items()}
+    contents = {name:path.read_bytes() for name,path in files.items()}
+    assert package.validate(pkgdir) == receipt
+    archive = next(pkgdir.glob('bv-*.tar.gz'))
+    original = archive.read_bytes()
+    archive.write_bytes(b'corrupt archive')
+    try: package.validate(pkgdir)
+    except ValueError: pass
+    else: raise SystemExit('corrupt archive was accepted')
+    archive.write_bytes(original)
+    with patch.object(package, 'release_assets', return_value={}), patch.object(package, 'download_assets'):
+        assert package.check(receipt['release_tag'], receipt['source_commit'], 'linux', root/'missing') == {'exists':False}
+    partial = dict(list(records.items())[:1])
+    with patch.object(package, 'release_assets', return_value=partial):
+        assert package.check(receipt['release_tag'], receipt['source_commit'], 'linux', root/'partial') == {'exists':False, 'partial':True}
+    unexpected = dict(records)
+    unexpected[receipt['release_tag'] + '-linux-extra.bin'] = {'name':'extra','size':1}
+    with patch.object(package, 'release_assets', return_value=unexpected):
+        try: package.check(receipt['release_tag'], receipt['source_commit'], 'linux', root/'unexpected')
+        except ValueError: pass
+        else: raise SystemExit('unexpected same-platform asset was accepted')
+    with patch.object(package, 'release_assets', return_value=records), patch.object(package, 'download_assets', side_effect=mocked_download(records, contents)):
+        assert package.check(receipt['release_tag'], receipt['source_commit'], 'linux', root/'full')['exists']
+    with patch.object(package, 'release_assets', return_value=records), patch.object(package, 'download_assets', side_effect=mocked_download(records, contents)):
+        try: package.check(receipt['release_tag'], 'b' * 40, 'linux', root/'identity-mismatch')
+        except ValueError: pass
+        else: raise SystemExit('assets with conflicting source commit were reused')
+    bad = dict(contents); bad[next(iter(bad))] = b'mismatching bytes'
+    with patch.object(package, 'release_assets', return_value=records), patch.object(package, 'download_assets', side_effect=mocked_download(records, bad)):
+        try: package.check(receipt['release_tag'], receipt['source_commit'], 'linux', root/'mismatch')
+        except (ValueError, RuntimeError): pass
+        else: raise SystemExit('mismatching asset bytes accepted')
+    bad = dict(contents); bad[next(name for name in bad if name.endswith('SHA256SUMS'))] = b'corrupt checksum file'
+    with patch.object(package, 'release_assets', return_value=records), patch.object(package, 'download_assets', side_effect=mocked_download(records, bad)):
+        try: package.check(receipt['release_tag'], receipt['source_commit'], 'linux', root/'checksum-mismatch')
+        except ValueError: pass
+        else: raise SystemExit('corrupt SHA256SUMS was accepted')
+    with patch.object(package, 'release_assets', return_value=records), patch.object(package, 'download_assets', side_effect=mocked_download(records, contents)), patch.object(package, 'run') as gh:
+        assert package.publish(pkgdir)['reused']
+        assert not any(call.args[:3] == ('gh', 'release', 'upload') for call in gh.call_args_list)
+    altered = dict(contents); altered[next(iter(altered))] = b'wrong'
+    with patch.object(package, 'release_assets', return_value=records), patch.object(package, 'download_assets', side_effect=mocked_download(records, altered)):
+        try: package.publish(pkgdir)
+        except ValueError: pass
+        else: raise SystemExit('publish would overwrite different bytes')
+    mutable = dict(partial)
+    def upload_and_list(*args, **kwargs):
+        if args[:3] == ('gh', 'release', 'upload'):
+            for name,path in files.items(): mutable[name] = {'name':name,'size':path.stat().st_size}
+        return b''
+    with patch.object(package, 'release_assets', side_effect=lambda tag: mutable), patch.object(package, 'download_assets', side_effect=mocked_download(mutable, contents)) as downloads, patch.object(package, 'run', side_effect=upload_and_list) as gh:
+        package.publish(pkgdir)
+        upload = next(call.args for call in gh.call_args_list if call.args[:3] == ('gh', 'release', 'upload'))
+        assert upload[:4] == ('gh', 'release', 'upload', receipt['release_tag']) and '--clobber' not in upload
+        assert {pathlib.Path(name).name for name in upload[6:]} == set(files) - set(partial)
+        assert downloads.call_args_list[-1].args[1] == package.platform_asset_names(receipt['release_tag'], 'linux')
 PY
-  exit
+  exit 0
 fi
 
 [[ $# == 5 && $1 == build ]] || { echo 'usage: custom-release.sh build darwin|linux TAG SHA ABS_OUTPUT' >&2; exit 2; }
@@ -233,7 +250,6 @@ for source in "$root/bin/bv" "$root"/share/bv/*; do
 done
 INSTALL
 chmod +x "$out/install.sh"
-# Smoke the actual archive layout installer twice, only in an explicit disposable prefix.
 "$out/install.sh" --prefix "$fixture/install"
 "$out/install.sh" --prefix "$fixture/install"
 [[ $(HOME="$fixture/home" "$fixture/install/bin/bv" --version) == "bv $tag" ]]

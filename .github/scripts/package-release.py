@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""bv install-package OCI contract; no native-artifact compatibility shim."""
+"""bv install-package GitHub Release asset contract."""
 import argparse
+import filecmp
 import gzip
 import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -13,11 +15,11 @@ import tempfile
 
 PROJECT = "beads_viewer"
 SOURCE = "https://github.com/cybito/beads_viewer.git"
-PACKAGE = "git.cybit.top/cybit/ias-bv"
-TYPE = "application/vnd.cybito.install-package.v1"
+REPOSITORY = "cybito/beads_viewer"
 TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+-custom\.[1-9][0-9]*\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-MEDIA = {"release.json": "application/json", "SHA256SUMS": "text/plain"}
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
+MAX_RELEASE_ASSETS = 1000
 
 
 def run(*args, cwd=None):
@@ -35,14 +37,22 @@ def absolute(value):
 
 
 def identity(tag, commit, platform):
-    if not TAG.fullmatch(tag) or not SHA.fullmatch(commit) or platform not in ('darwin','linux'):
+    if not TAG.fullmatch(tag) or not SHA.fullmatch(commit) or platform not in ('darwin', 'linux'):
         raise ValueError("invalid release identity")
     return dict(schema=1, project=PROJECT, source_repo=SOURCE, source_commit=commit,
                 release_tag=tag, platform=platform, architecture="arm64")
 
 
-def hash_bytes(data):
-    return hashlib.sha256(data).hexdigest()
+def hash_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_size(path):
+    return path.stat().st_size
 
 
 def validate(directory):
@@ -63,10 +73,10 @@ def validate(directory):
         if set(f) != {"name", "sha256", "size"} or name != f"bv-{receipt['release_tag']}-{receipt['platform']}-arm64.tar.gz" or name in names:
             raise ValueError("invalid payload filename")
         names.add(name)
-        data = (directory / name).read_bytes()
-        if f["size"] != len(data) or f["sha256"] != hash_bytes(data):
+        path = directory / name
+        if f["size"] != file_size(path) or f["sha256"] != hash_file(path):
             raise ValueError("payload checksum mismatch")
-    sums = "".join(f"{hash_bytes((directory / n).read_bytes())}  {n}\n" for n in sorted(names - {"SHA256SUMS"}))
+    sums = "".join(f"{hash_file(directory / n)}  {n}\n" for n in sorted(names - {"SHA256SUMS"}))
     if (directory / "SHA256SUMS").read_text() != sums:
         raise ValueError("SHA256SUMS mismatch")
     if {p.name for p in directory.iterdir()} != names or any(not p.is_file() or p.is_symlink() for p in directory.iterdir()):
@@ -74,72 +84,76 @@ def validate(directory):
     return receipt
 
 
-def fetch(reference, config):
-    p = subprocess.run(["oras", "manifest", "fetch", "--registry-config", str(config), reference], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if p.returncode:
-        error = p.stderr.decode(errors="replace")
-        # Only structured distribution error codes mean absent. HTTP/auth/network errors do not.
-        if re.search(r"\b(?:MANIFEST_UNKNOWN|NAME_UNKNOWN|manifest_unknown|name_unknown)\b", error):
-            return None
-        raise RuntimeError(error.strip())
-    return p.stdout
+def asset_name(tag, platform, name):
+    return f"{tag}-{platform}-{name}"
 
 
-def verify(reference, output, config):
-    if not re.fullmatch(re.escape(PACKAGE) + r"@sha256:[0-9a-f]{64}", reference):
-        raise ValueError("verification requires this project's immutable digest reference")
-    raw = fetch(reference, config)
-    if raw is None or hash_bytes(raw) != reference.rsplit(":", 1)[1]:
-        raise ValueError("manifest digest mismatch")
-    manifest = json.loads(raw)
-    if manifest.get("artifactType") != TYPE or manifest.get("schemaVersion") != 2:
-        raise ValueError("wrong artifact type")
+def expected_assets(directory, receipt):
+    return {asset_name(receipt["release_tag"], receipt["platform"], p.name): p for p in directory.iterdir()}
+
+
+def release_assets(tag):
+    data = json.loads(run("gh", "release", "view", tag, "--repo", REPOSITORY, "--json", "assets"))
+    return {item["name"]: item for item in data["assets"]}
+
+
+def download_assets(tag, assets, output):
     output.mkdir(parents=True, exist_ok=True)
     if list(output.iterdir()):
         raise ValueError("verification output must be empty")
-    names = set()
-    with tempfile.TemporaryDirectory() as tmp:
-        for descriptor in [manifest["config"], *manifest["layers"]]:
-            digest = descriptor["digest"]
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-                raise ValueError("invalid descriptor digest")
-            blob = Path(tmp) / digest.split(":")[1]
-            run("oras", "blob", "fetch", "--registry-config", str(config), "--output", str(blob), PACKAGE + "@" + digest)
-            data = blob.read_bytes()
-            if len(data) != descriptor["size"] or hash_bytes(data) != digest.split(":")[1]:
-                raise ValueError("descriptor checksum mismatch")
-        for layer in manifest["layers"]:
-            name = layer.get("annotations", {}).get("org.opencontainers.image.title", "")
-            archive_name = re.fullmatch(r"bv-v[0-9]+\.[0-9]+\.[0-9]+-custom\.[1-9][0-9]*-(darwin|linux)-arm64\.tar\.gz", name)
-            if (name not in MEDIA and not archive_name) or name in names or layer["mediaType"] != MEDIA.get(name, "application/gzip"):
-                raise ValueError("unsafe or incorrect layer")
-            names.add(name)
-    run("oras", "pull", "--registry-config", str(config), "--output", str(output), reference)
-    receipt = validate(output)
-    if names != {p.name for p in output.iterdir()}:
-        raise ValueError("layer/payload mismatch")
-    for layer in manifest["layers"]:
-        data = (output / layer["annotations"]["org.opencontainers.image.title"]).read_bytes()
-        if hash_bytes(data) != layer["digest"].split(":")[1] or len(data) != layer["size"]:
-            raise ValueError("independent pull mismatch")
-    annotations = manifest.get("annotations", {})
-    for k, v in {"source": SOURCE, "revision": receipt["source_commit"], "version": receipt["release_tag"]}.items():
-        if annotations.get("org.opencontainers.image." + k) != v:
-            raise ValueError("source annotation mismatch")
-    return receipt
+    args = ["gh", "release", "download", tag, "--repo", REPOSITORY, "--dir", str(output)]
+    for name in assets:
+        args.extend(["--pattern", name])
+    run(*args)
+
+def platform_asset_names(tag, platform):
+    return [asset_name(tag, platform, name) for name in (
+        "release.json", "SHA256SUMS", f"bv-{tag}-{platform}-arm64.tar.gz"
+    )]
 
 
-def check(tag, commit, platform, output, config):
+def reject_unexpected_platform_assets(tag, platform, present, expected_names):
+    prefix = f"{tag}-{platform}-"
+    unexpected = [name for name in present if name.startswith(prefix) and name not in expected_names]
+    if unexpected:
+        raise ValueError("unexpected assets for this platform: " + ", ".join(sorted(unexpected)))
+
+
+def verify_download(tag, commit, platform, output, assets=None):
     expected = identity(tag, commit, platform)
-    reference = f"{PACKAGE}:{tag}-{platform}-arm64"
-    raw = fetch(reference, config)
-    if raw is None:
+    present = release_assets(tag) if assets is None else assets
+    names = platform_asset_names(tag, platform)
+    reject_unexpected_platform_assets(tag, platform, present, names)
+    relevant = [name for name in names if name in present]
+    if not relevant:
         return {"exists": False}
-    immutable = PACKAGE + "@sha256:" + hash_bytes(raw)
-    receipt = verify(immutable, output, config)
+    if len(relevant) != len(names):
+        # Existing names are compared against freshly built bytes in publish;
+        # this permits safe recovery of an interrupted platform upload.
+        return {"exists": False, "partial": True}
+    download_assets(tag, relevant, output)
+    local = {p.name: p for p in output.iterdir()}
+    if set(local) != set(names):
+        raise ValueError("downloaded asset set is incomplete or contains unexpected files")
+    for name in names:
+        if present[name].get("size", local[name].stat().st_size) != local[name].stat().st_size:
+            raise ValueError("downloaded asset size differs from release metadata")
+    package_dir = output / "package"
+    package_dir.mkdir()
+    prefix = f"{tag}-{platform}-"
+    for name in names:
+        (output / name).rename(package_dir / name[len(prefix):])
+    receipt = validate(package_dir)
     if any(receipt[k] != v for k, v in expected.items()):
-        raise ValueError("published tag belongs to a different release identity")
-    return {"exists": True, "reference": immutable}
+        raise ValueError("published assets belong to a different release identity")
+    for name, path in expected_assets(package_dir, receipt).items():
+        if present[name].get("size", file_size(path)) != file_size(path):
+            raise ValueError("asset metadata size mismatch")
+    return {"exists": True, "assets": names, "directory": str(package_dir)}
+
+
+def check(tag, commit, platform, output):
+    return verify_download(tag, commit, platform, output)
 
 
 def pack(args):
@@ -165,48 +179,47 @@ def pack(args):
             info.mtime = epoch
             with path.open("rb") as data:
                 archive.addfile(info, data)
-    data = (out / name).read_bytes()
-    receipt["files"] = [{"name": name, "sha256": hash_bytes(data), "size": len(data)}]
+    archive_path = out / name
+    receipt["files"] = [{"name": name, "sha256": hash_file(archive_path), "size": file_size(archive_path)}]
     (out / "release.json").write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
-    (out / "SHA256SUMS").write_text("".join(f"{hash_bytes((out / n).read_bytes())}  {n}\n" for n in sorted([name, "release.json"])))
+    (out / "SHA256SUMS").write_text("".join(f"{hash_file(out / n)}  {n}\n" for n in sorted([name, "release.json"])))
     validate(out)
     return {"directory": str(out)}
 
 
-def publish(directory, config):
+def publish(directory):
     receipt = validate(directory)
+    assets = release_assets(receipt["release_tag"])
+    files = expected_assets(directory, receipt)
+    reject_unexpected_platform_assets(receipt["release_tag"], receipt["platform"], assets, set(files))
+    for name, path in files.items():
+        if path.stat().st_size >= MAX_FILE_SIZE:
+            raise ValueError(f"asset exceeds GitHub's per-file limit: {path.name}")
+        if name in assets:
+            with tempfile.TemporaryDirectory() as tmp:
+                downloaded = Path(tmp)
+                download_assets(receipt["release_tag"], [name], downloaded)
+                existing = downloaded / name
+                if not filecmp.cmp(existing, path, shallow=False):
+                    raise ValueError(f"refusing to overwrite mismatching release asset: {name}")
+    missing = [(name, path) for name, path in files.items() if name not in assets]
+    if not missing:
+        return {"assets": sorted(files), "reused": True}
+    if len(assets) + len(missing) > MAX_RELEASE_ASSETS:
+        raise ValueError("upload would exceed GitHub's 1000 assets per release limit")
     with tempfile.TemporaryDirectory() as tmp:
-        existing = check(receipt["release_tag"], receipt["source_commit"], receipt["platform"], Path(tmp) / "existing", config)
-        if existing["exists"]:
-            if json.loads((Path(tmp) / "existing" / "release.json").read_bytes()) != receipt:
-                raise ValueError("refusing to replace published bytes")
-            return dict(reference=existing["reference"], digest=existing["reference"].split("@", 1)[1])
-        created = run("git", "show", "-s", "--format=%cI", receipt["source_commit"]).decode().strip()
-        from datetime import datetime, timezone
-        created = datetime.fromisoformat(created).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        layout = str(Path(tmp) / "layout")
-        local = layout + ":release"
-        annotations = {"created": created, "source": SOURCE, "revision": receipt["source_commit"], "version": receipt["release_tag"]}
-        argv = ["oras", "push", "--oci-layout", local, "--artifact-type", TYPE]
-        for k, v in annotations.items():
-            argv += ["--annotation", "org.opencontainers.image." + k + "=" + v]
-        argv += [p.name + ":" + MEDIA.get(p.name, "application/gzip") for p in sorted(directory.iterdir())]
-        run(*argv, cwd=directory)
-        raw = run("oras", "manifest", "fetch", "--oci-layout", local)
-        digest = "sha256:" + hash_bytes(raw)
-        target = f"{PACKAGE}:{receipt['release_tag']}-{receipt['platform']}-arm64"
-        late = check(receipt["release_tag"], receipt["source_commit"], receipt["platform"], Path(tmp) / "late", config)
-        if late["exists"]:
-            old = Path(tmp) / "late"
-            if {p.name for p in directory.iterdir()} != {p.name for p in old.iterdir()} or any(p.read_bytes() != (old / p.name).read_bytes() for p in directory.iterdir()):
-                raise ValueError("refusing replacement of bytes published during this build")
-            return dict(reference=late["reference"], digest=late["reference"].split("@", 1)[1])
-        run("oras", "cp", "--from-oci-layout", "--to-registry-config", str(config), local, target)
-        reference = PACKAGE + "@" + digest
-        verify(reference, Path(tmp) / "pulled", config)
-        if fetch(target, config) != raw:
-            raise ValueError("published tag manifest mismatch")
-        return {"reference": reference, "digest": digest}
+        upload_dir = Path(tmp)
+        upload_paths = []
+        for name, path in missing:
+            destination = upload_dir / name
+            shutil.copyfile(path, destination)
+            upload_paths.append(str(destination))
+        run("gh", "release", "upload", receipt["release_tag"], "--repo", REPOSITORY, *upload_paths)
+    with tempfile.TemporaryDirectory() as tmp:
+        result = verify_download(receipt["release_tag"], receipt["source_commit"], receipt["platform"], Path(tmp))
+        if not result["exists"]:
+            raise ValueError("uploaded platform assets were not readable")
+    return {"assets": sorted(files), "reused": False}
 
 
 def main():
@@ -222,24 +235,14 @@ def main():
             sub.add_argument("--input-dir", required=True)
     sub = commands.add_parser("publish")
     sub.add_argument("--directory", required=True)
-    sub.add_argument("--registry-config", required=True)
-    sub = commands.add_parser("verify")
-    sub.add_argument("--reference", required=True)
-    sub.add_argument("--output-dir", required=True)
     args = parser.parse_args()
-    # Anonymous operations use an explicit isolated config, never host credentials.
-    with tempfile.TemporaryDirectory() as tmp:
-        config = Path(tmp) / "anonymous.json"
-        config.write_text('{"auths":{}}')
-        if args.command == "pack":
-            result = pack(args)
-        elif args.command == "check":
-            result = check(args.tag, args.commit, args.platform, absolute(args.output_dir), config)
-        elif args.command == "verify":
-            result = verify(args.reference, absolute(args.output_dir), config)
-        else:
-            result = publish(absolute(args.directory), absolute(args.registry_config))
-        print(json.dumps(result, sort_keys=True))
+    if args.command == "pack":
+        result = pack(args)
+    elif args.command == "check":
+        result = check(args.tag, args.commit, args.platform, absolute(args.output_dir))
+    else:
+        result = publish(absolute(args.directory))
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":
