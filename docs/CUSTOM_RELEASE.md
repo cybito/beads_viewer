@@ -15,7 +15,7 @@ Publishing a GitHub Release triggers the workflow; an ordinary push (including
 a tag push), draft release, or pull request does not publish packages. The tag
 must be `v<major>.<minor>.<patch>-custom.<positive integer>`, its version base
 must match `pkg/version/version.go`, and its dereferenced commit must be an
-ancestor of `origin/custom`. This migration's first asset-bearing release uses
+ancestor of `origin/custom`. This migration's first fully validated asset release uses
 `v0.25.0-custom.5`; existing tags/releases are never moved. For example:
 
 ```sh
