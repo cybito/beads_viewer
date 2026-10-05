@@ -1,0 +1,176 @@
+name: Custom release
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+env:
+  ORAS_DARWIN_SHA256: f33fc12753c54172b0d0d19eaa0318d3f90fe9b094d96e8b259c881713c92e1c
+  ORAS_LINUX_SHA256: ac7156f93a21e903f7ad606c792f3560f17e0cd0e36365634701b1e7cc4e4eca
+jobs:
+  validate:
+    if: github.repository == 'cybito/beads_viewer' && !github.event.release.draft
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      sha: ${{ steps.validate.outputs.sha }}
+      tag: ${{ steps.validate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch authoritative custom ref
+        run: git fetch --no-tags origin refs/heads/custom:refs/remotes/origin/custom
+      - name: Exercise release validation boundaries
+        run: bash .github/scripts/custom-release.sh validation-regressions
+      - name: Validate release tag ancestry and version
+        id: validate
+        run: bash .github/scripts/custom-release.sh validate-release
+  build:
+    needs: validate
+    environment: forgejo-registry
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin
+            runner: macos-26
+          - platform: linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    concurrency:
+      group: custom-release-${{ github.repository }}-${{ needs.validate.outputs.tag }}-${{ matrix.platform }}
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-pinned ORAS 1.3.3
+        run: bash .github/scripts/custom-release.sh setup-oras "$PLATFORM"
+      - name: Check immutable release before compiling
+        id: existing
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/package-release.py check --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" --platform "$PLATFORM" --output-dir "$RUNNER_TEMP/existing" > "$RUNNER_TEMP/existing.json"
+          python3 - <<'PY'
+          import json, os
+          result = json.load(open(os.environ['RUNNER_TEMP'] + '/existing.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('exists=' + str(result['exists']).lower() + '\n')
+          if result['exists']:
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  summary.write('Verified existing immutable package: `' + result['reference'] + '`\n')
+          PY
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        if: steps.existing.outputs.exists != 'true'
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Build native bv and robot dependency smoke
+        if: steps.existing.outputs.exists != 'true'
+        run: bash .github/scripts/custom-release.sh build "$PLATFORM" "$RELEASE_TAG" "$SOURCE_SHA" "$RUNNER_TEMP/payload"
+      - name: Pack archive and smoke explicit-prefix installation
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          BV_NO_BROWSER: '1'
+          BV_TEST_MODE: '1'
+          BV_NO_SAVED_CONFIG: '1'
+          BV_NO_UPDATE_CHECK: '1'
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/package-release.py pack --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" --platform "$PLATFORM" --input-dir "$RUNNER_TEMP/payload" --output-dir "$RUNNER_TEMP/package"
+          mkdir -p "$RUNNER_TEMP/archive-smoke" "$RUNNER_TEMP/archive-home"
+          tar -xzf "$RUNNER_TEMP/package/bv-$RELEASE_TAG-$PLATFORM-arm64.tar.gz" -C "$RUNNER_TEMP/archive-smoke"
+          "$RUNNER_TEMP/archive-smoke/install.sh" --prefix "$RUNNER_TEMP/archive-prefix"
+          "$RUNNER_TEMP/archive-smoke/install.sh" --prefix "$RUNNER_TEMP/archive-prefix"
+          test "$(HOME="$RUNNER_TEMP/archive-home" "$RUNNER_TEMP/archive-prefix/bin/bv" --version)" = "bv $RELEASE_TAG"
+      - name: Publish and independently pull immutable OCI package
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          FORGEJO_REGISTRY_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +x
+          test -n "$FORGEJO_REGISTRY_TOKEN"
+          umask 077
+          mkdir -p "$RUNNER_TEMP/registry-auth"
+          chmod 700 "$RUNNER_TEMP/registry-auth"
+          config="$RUNNER_TEMP/registry-auth/config.json"
+          trap 'rm -f "$config"; unset FORGEJO_REGISTRY_TOKEN' EXIT
+          printf '%s' "$FORGEJO_REGISTRY_TOKEN" | oras login git.cybit.top --username cybit --password-stdin --registry-config "$config"
+          chmod 600 "$config"
+          python3 .github/scripts/package-release.py publish --directory "$RUNNER_TEMP/package" --registry-config "$config" > "$RUNNER_TEMP/published.json"
+          python3 - <<'PY'
+          import json, os
+          result = json.load(open(os.environ['RUNNER_TEMP'] + '/published.json'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('Published and verified: `' + result['reference'] + '`\n')
+          PY
+      - name: Always remove registry credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/registry-auth/config.json"
+  summarize:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    concurrency:
+      group: custom-release-notes-${{ github.repository }}-${{ needs.validate.outputs.tag }}
+      cancel-in-progress: false
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      SOURCE_SHA: ${{ needs.validate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - name: Install checksum-pinned ORAS 1.3.3
+        run: bash .github/scripts/custom-release.sh setup-oras linux
+      - name: Verify both platforms anonymously
+        run: |
+          set -euo pipefail
+          for platform in darwin linux; do
+            python3 .github/scripts/package-release.py check --tag "$RELEASE_TAG" --commit "$SOURCE_SHA" --platform "$platform" --output-dir "$RUNNER_TEMP/verified-$platform" > "$RUNNER_TEMP/result-$platform.json"
+          done
+      - name: Update only managed release notes block
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          tag, sha = os.environ['RELEASE_TAG'], os.environ['SOURCE_SHA']
+          api = 'repos/cybito/beads_viewer/releases/tags/' + tag
+          release = json.loads(subprocess.check_output(['gh', 'api', api]))
+          if release['assets']:
+              raise SystemExit('GitHub Release assets must be empty')
+          rows = []
+          for platform in ('darwin', 'linux'):
+              result = json.load(open(os.environ['RUNNER_TEMP'] + '/result-' + platform + '.json'))
+              if not result['exists']:
+                  raise SystemExit('missing platform package')
+              rows.append((platform, result['reference']))
+          start, end = '<!-- custom-builds:start -->', '<!-- custom-builds:end -->'
+          block = start + '\n## Custom ARM64 builds\n\nSource: [`' + sha + '`](https://github.com/cybito/beads_viewer/commit/' + sha + ')\n\nRelease: `' + tag + '`\n\n[Forgejo package](https://git.cybit.top/cybit/-/packages/container/ias-bv)\n\n'
+          for platform, ref in rows:
+              block += '- **' + platform + '/arm64**: `' + ref + '`\n\n  ```sh\n  oras pull ' + ref + '\n  ```\n\n'
+          block += end
+          body = release.get('body') or ''
+          if body.count(start) != body.count(end) or body.count(start) > 1:
+              raise SystemExit('ambiguous managed notes markers')
+          if start in body:
+              if body.index(start) > body.index(end):
+                  raise SystemExit('reversed managed notes markers')
+              body = re.sub(re.escape(start) + r'.*?' + re.escape(end), lambda _: block, body, flags=re.S)
+          else:
+              body = body.rstrip() + '\n\n' + block
+          subprocess.run(['gh', 'api', '--method', 'PATCH', 'repos/cybito/beads_viewer/releases/' + str(release['id']), '--input', '-'], input=json.dumps({'body':body}).encode(), check=True)
+          PY
