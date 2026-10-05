@@ -191,6 +191,7 @@ else:
 (root / 'toolchains.json').write_text(json.dumps({'go':'go1.26.8'}))
 PY
 fixture=$(mktemp -d)
+fixture=$(CDPATH= cd -- "$fixture" && pwd -P)
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/work/.beads" "$fixture/home" "$fixture/config"
 cat > "$fixture/work/.beads/issues.jsonl" <<'EOF'

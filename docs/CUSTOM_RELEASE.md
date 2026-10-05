@@ -16,13 +16,13 @@ a tag push), draft release, or pull request does not publish packages. The tag
 must be `v<major>.<minor>.<patch>-custom.<positive integer>`, its version base
 must match `pkg/version/version.go`, and its dereferenced commit must be an
 ancestor of `origin/custom`. This migration's first asset-bearing release uses
-`v0.25.0-custom.4`; existing tags/releases are never moved. For example:
+`v0.25.0-custom.5`; existing tags/releases are never moved. For example:
 
 ```sh
 sha=$(git rev-parse custom)
-gh release create v0.25.0-custom.4 \
+gh release create v0.25.0-custom.5 \
   --repo cybito/beads_viewer --target "$sha" \
-  --title v0.25.0-custom.4 \
+  --title v0.25.0-custom.5 \
   --notes 'Custom bv source on GitHub; ARM64 installation packages are attached below.'
 ```
 
@@ -73,14 +73,14 @@ Download and install, for example:
 ```sh
 mkdir -p /absolute/path/bv-download
 cd /absolute/path/bv-download
-gh release download v0.25.0-custom.4 --repo cybito/beads_viewer \
-  --pattern 'v0.25.0-custom.4-linux-*'
-for file in v0.25.0-custom.4-linux-*; do
-  mv "$file" "${file#v0.25.0-custom.4-linux-}"
+gh release download v0.25.0-custom.5 --repo cybito/beads_viewer \
+  --pattern 'v0.25.0-custom.5-linux-*'
+for file in v0.25.0-custom.5-linux-*; do
+  mv "$file" "${file#v0.25.0-custom.5-linux-}"
 done
 sha256sum -c SHA256SUMS
 mkdir unpacked
-tar -xzf bv-v0.25.0-custom.4-linux-arm64.tar.gz -C unpacked
+tar -xzf bv-v0.25.0-custom.5-linux-arm64.tar.gz -C unpacked
 ./unpacked/install.sh --prefix /absolute/path/chosen-prefix
 /absolute/path/chosen-prefix/bin/bv --version
 ```
