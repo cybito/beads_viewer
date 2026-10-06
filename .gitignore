@@ -6,6 +6,8 @@ cmd/bv/bv
 .DS_Store
 
 # Build artifacts
+__pycache__/
+*.py[cod]
 dist/
 a.out
 coverage.out
