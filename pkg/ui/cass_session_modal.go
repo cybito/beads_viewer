@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -395,7 +396,12 @@ func copyToClipboardStatusCmd(text, success string, requestID uint64) tea.Cmd {
 func copyToClipboard(ctx context.Context, text string) error {
 	cmd, err := clipboardCommand(ctx)
 	if err != nil {
-		return err
+		// No helper can run here — a display-less SSH session is the usual
+		// reason. Ask the terminal itself to set the clipboard (#201).
+		if osc52Err := osc52Copy(text); osc52Err != nil {
+			return fmt.Errorf("%w (OSC 52 fallback: %w)", err, osc52Err)
+		}
+		return nil
 	}
 
 	cmd.Stdin = strings.NewReader(text)
@@ -403,7 +409,72 @@ func copyToClipboard(ctx context.Context, text string) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("clipboard helper timed out: %w", ctxErr)
 		}
+		// The helper looked usable and still failed. The copy landing matters
+		// more than which mechanism landed it, so try the terminal before
+		// reporting nothing happened.
+		if osc52Err := osc52Copy(text); osc52Err == nil {
+			return nil
+		}
 		return fmt.Errorf("run clipboard helper: %w", err)
+	}
+	return nil
+}
+
+// osc52Limit bounds the base64 payload of an OSC 52 write. Terminals and
+// multiplexers cap how much they will accept and several drop an oversized
+// sequence outright rather than truncating it, so a copy that cannot land is
+// reported as failed instead of sent and silently lost.
+const osc52Limit = 74994
+
+// osc52Sequence builds the OSC 52 escape sequence for text, wrapped for the
+// multiplexer in use.
+func osc52Sequence(text string) (string, error) {
+	encoded := base64.StdEncoding.EncodeToString([]byte(text))
+	if len(encoded) > osc52Limit {
+		return "", fmt.Errorf("selection too large for terminal clipboard (%d bytes encoded, limit %d)",
+			len(encoded), osc52Limit)
+	}
+	sequence := "\x1b]52;c;" + encoded + "\x07"
+
+	// tmux implements OSC 52 itself: it sets its own paste buffer and forwards
+	// the sequence to the outer terminal. Wrapping it in a `\ePtmux;` DCS
+	// passthrough instead tells tmux *not* to interpret it, which additionally
+	// requires `allow-passthrough`; verified against a live tmux, the wrapped
+	// form leaves the clipboard untouched while the raw form sets it. So tmux
+	// gets it raw.
+	//
+	// GNU screen does not implement OSC 52, so there the DCS passthrough is the
+	// only way to reach the outer terminal. tmux sets TERM to screen-* as well,
+	// hence the explicit $TMUX test first.
+	if os.Getenv("TMUX") == "" && strings.HasPrefix(os.Getenv("TERM"), "screen") {
+		sequence = "\x1bP" + sequence + "\x1b\\"
+	}
+	return sequence, nil
+}
+
+// osc52Copy asks the terminal to set the system clipboard with OSC 52.
+//
+// This is the only mechanism that reaches the clipboard of the machine the user
+// is sitting at: the escape sequence travels back over SSH and is executed by
+// the local terminal emulator. It is written to the controlling terminal rather
+// than stdout so it does not pass through Bubble Tea's frame buffer, and the
+// sequence is emitted in a single write so a concurrent repaint cannot split it.
+func osc52Copy(text string) error {
+	sequence, err := osc52Sequence(text)
+	if err != nil {
+		return err
+	}
+
+	// The controlling terminal is the right sink even when stdout is a pipe.
+	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+		defer tty.Close()
+		if _, writeErr := tty.WriteString(sequence); writeErr != nil {
+			return fmt.Errorf("write OSC 52 to terminal: %w", writeErr)
+		}
+		return nil
+	}
+	if _, err := os.Stdout.WriteString(sequence); err != nil {
+		return fmt.Errorf("write OSC 52 to stdout: %w", err)
 	}
 	return nil
 }
@@ -420,11 +491,18 @@ func clipboardCommand(ctx context.Context) (*exec.Cmd, error) {
 				return exec.CommandContext(ctx, "wl-copy"), nil
 			}
 		}
-		if _, err := exec.LookPath("xclip"); err == nil {
-			return exec.CommandContext(ctx, "xclip", "-in", "-selection", "clipboard"), nil
-		}
-		if _, err := exec.LookPath("xsel"); err == nil {
-			return exec.CommandContext(ctx, "xsel", "--input", "--clipboard"), nil
+		// xclip and xsel are X clients: without a display they exit 1 with
+		// "Can't open display", which is the common case on a server you SSH
+		// into. Being on PATH is not evidence they can run (#201), so gate them
+		// the way wl-copy is already gated and let the caller fall back to
+		// OSC 52, which reaches the clipboard at the *local* end of the session.
+		if os.Getenv("DISPLAY") != "" {
+			if _, err := exec.LookPath("xclip"); err == nil {
+				return exec.CommandContext(ctx, "xclip", "-in", "-selection", "clipboard"), nil
+			}
+			if _, err := exec.LookPath("xsel"); err == nil {
+				return exec.CommandContext(ctx, "xsel", "--input", "--clipboard"), nil
+			}
 		}
 		if _, err := exec.LookPath("termux-clipboard-set"); err == nil {
 			return exec.CommandContext(ctx, "termux-clipboard-set"), nil

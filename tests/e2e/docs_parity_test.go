@@ -97,13 +97,14 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 	for _, tc := range []struct {
 		document string
 		prefix   string
+		stale    string
 		check    func([]any) bool
 	}{
-		{"README.md", "bv --robot-plan | jq ", func(rows []any) bool {
+		{"README.md", "bv --robot-plan | jq ", ".tracks[].items[] | {id, unblocks}", func(rows []any) bool {
 			row, ok := rows[0].(map[string]any)
 			return ok && len(rows) == 1 && row["id"] == "ROOT" && reflect.DeepEqual(row["unblocks"], []any{"MID"})
 		}},
-		{"README.md", "bv --robot-insights | jq '.full_stats.core_number", func(rows []any) bool {
+		{"README.md", "bv --robot-insights | jq '.full_stats.core_number", ".cores | to_entries | sort_by(-.value)[:5]", func(rows []any) bool {
 			entries, ok := rows[0].([]any)
 			if !ok || len(rows) != 1 || len(entries) != 3 {
 				return false
@@ -122,10 +123,10 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			return reflect.DeepEqual(keys, map[string]bool{"ROOT": true, "MID": true, "LEAF": true})
 		}},
-		{"README.md", "bv --robot-insights | jq '.Articulation", func(rows []any) bool {
+		{"README.md", "bv --robot-insights | jq '.Articulation", ".articulation", func(rows []any) bool {
 			return reflect.DeepEqual(rows, []any{[]any{"MID"}})
 		}},
-		{"README.md", "bv --robot-priority | jq ", func(rows []any) bool {
+		{"README.md", "bv --robot-priority | jq ", ".priority.recommendations[] | select(.confidence > 0.6)", func(rows []any) bool {
 			foundBridge := false
 			for _, entry := range rows {
 				row, ok := entry.(map[string]any)
@@ -142,7 +143,7 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			return foundBridge
 		}},
-		{"AGENTS.md", "bv --robot-triage | jq ", func(rows []any) bool {
+		{"AGENTS.md", "bv --robot-triage | jq ", ".quick_ref", func(rows []any) bool {
 			row, ok := rows[0].(map[string]any)
 			if !ok || len(rows) != 1 || row["open_count"] != float64(3) || row["actionable_count"] != float64(1) {
 				return false
@@ -153,6 +154,16 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			pick, ok := picks[0].(map[string]any)
 			return ok && pick["id"] == "ROOT"
+		}},
+		{"SKILL.md", "bv --robot-plan | jq ", ".summary.highest_impact", func(rows []any) bool {
+			return reflect.DeepEqual(rows, []any{"ROOT"})
+		}},
+		{"SKILL.md", "bv --robot-triage | jq '.triage.recommendations[0]", ".recommendations[0]", func(rows []any) bool {
+			row, ok := rows[0].(map[string]any)
+			// Recommendations rank impact, while quick_ref above selects ready
+			// work. This is the documented "not necessarily claimable" case.
+			return ok && len(rows) == 1 && row["id"] == "MID" && row["claimable"] == false &&
+				reflect.DeepEqual(row["blocked_by"], []any{"ROOT"}) && reflect.DeepEqual(row["unblocks_ids"], []any{"LEAF"})
 		}},
 	} {
 		t.Run(tc.document+"/"+tc.prefix, func(t *testing.T) {
@@ -180,6 +191,7 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			if err != nil {
 				t.Fatalf("copied bv command: %v\n%s", err, stderr.String())
 			}
+			t.Logf("fixture=ROOT<-MID<-LEAF argv=%q SOURCE_DATE_EPOCH=1788220800 exit=0 stdout=%s stderr=%s", cmd.Args, payload, stderr.String())
 			query := exec.Command(jq, "-c", quoted[1])
 			query.Stdin = bytes.NewReader(payload)
 			query.Stderr = &stderr
@@ -203,6 +215,164 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			if len(rows) == 0 || !tc.check(rows) {
 				t.Fatalf("documented query returned the wrong fixture result: %s", output)
+			}
+			// These deliberately stale paths previously bypassed the actual robot
+			// envelopes or used the wrong metric casing. The same fixture and
+			// consumer must reject them rather than accepting an empty/null result.
+			stale := exec.Command(jq, "-c", tc.stale)
+			stale.Stdin = bytes.NewReader(payload)
+			var staleStderr bytes.Buffer
+			stale.Stderr = &staleStderr
+			staleOutput, staleErr := stale.Output()
+			t.Logf("copied jq=%q expected fixture result observed=%s; stale jq=%q exit=%v stdout=%s stderr=%s", quoted[1], output, tc.stale, staleErr, staleOutput, staleStderr.String())
+			if staleErr == nil {
+				var staleRows []any
+				decoder := json.NewDecoder(bytes.NewReader(staleOutput))
+				for {
+					var row any
+					if err := decoder.Decode(&row); err == io.EOF {
+						break
+					} else if err != nil {
+						t.Fatalf("decode stale-query control: %v", err)
+					}
+					staleRows = append(staleRows, row)
+				}
+				if len(staleRows) > 0 && tc.check(staleRows) {
+					t.Fatalf("stale query unexpectedly satisfied the documented behavior: %s", staleOutput)
+				}
+			} else if _, ok := staleErr.(*exec.ExitError); !ok {
+				t.Fatalf("stale query did not execute: %v", staleErr)
+			}
+		})
+	}
+}
+
+func TestDocsParity_CopiedHistoryQueryPreservesUnits(t *testing.T) {
+	for _, name := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB", "BEADS_JSONL"} {
+		t.Setenv(name, "")
+	}
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("actual copied history query requires jq on PATH")
+	}
+	bv := buildBvBinary(t)
+	dir := t.TempDir()
+	git := func(date string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+			"GIT_AUTHOR_NAME=Docs Test", "GIT_AUTHOR_EMAIL=docs@example.invalid",
+			"GIT_COMMITTER_NAME=Docs Test", "GIT_COMMITTER_EMAIL=docs@example.invalid",
+			"GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("fixture git argv=%q date=%s exit=%v output=%s", cmd.Args, date, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("2026-06-01T00:00:00Z", "init", "--initial-branch=main")
+	steps := []struct {
+		status string
+		event  string
+		date   string
+	}{
+		{"open", "created", "2026-06-01T00:00:00Z"},
+		{"in_progress", "claimed", "2026-06-02T00:00:00Z"},
+		{"closed", "closed", "2026-06-04T00:00:00Z"},
+	}
+	commits := make(map[string]string)
+	for _, step := range steps {
+		writeBeads(t, dir, fmt.Sprintf(`{"id":"BV-123","title":"Documented lifecycle","status":%q,"priority":1,"issue_type":"task"}`, step.status))
+		if err := os.WriteFile(filepath.Join(dir, "work.go"), []byte(fmt.Sprintf("package work\nconst State = %q\n", step.status)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		git(step.date, "add", ".beads", "work.go")
+		git(step.date, "-c", "commit.gpgsign=false", "commit", "-m", "BV-123 "+step.event)
+		commits[step.event] = git(step.date, "rev-parse", "HEAD")
+	}
+	readme := repoFile(t, "README.md")
+	line := regexp.MustCompile(`(?m)^bv --robot-history \| jq '([^']+)'$`).FindStringSubmatch(readme)
+	if len(line) != 2 {
+		t.Fatal("README must contain a copyable robot-history query with explicit duration units")
+	}
+	cmd := exec.Command(bv, "--robot-history")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "SOURCE_DATE_EPOCH=1788220800")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	payload, err := cmd.Output()
+	t.Logf("fixture=BV-123 created June 1, claimed June 2, closed June 4 UTC commits=%v argv=%q SOURCE_DATE_EPOCH=1788220800 exit=%v stdout=%s stderr=%s", commits, cmd.Args, err, payload, stderr.String())
+	if err != nil {
+		t.Fatal("copied robot-history command failed")
+	}
+	var report struct {
+		Histories map[string]struct {
+			Events []struct {
+				EventType string `json:"event_type"`
+				CommitSHA string `json:"commit_sha"`
+			} `json:"events"`
+			Milestones map[string]struct {
+				Timestamp string `json:"timestamp"`
+				CommitSHA string `json:"commit_sha"`
+			} `json:"milestones"`
+		} `json:"histories"`
+		CommitIndex map[string][]string `json:"commit_index"`
+	}
+	if err := json.Unmarshal(payload, &report); err != nil {
+		t.Fatal(err)
+	}
+	history := report.Histories["BV-123"]
+	if len(report.Histories) != 1 || len(history.Events) != 3 || len(history.Milestones) != 3 {
+		t.Fatalf("history must contain one bead with its three actual lifecycle events and named milestones: %+v", report)
+	}
+	for i, step := range steps {
+		event := history.Events[i]
+		milestone := history.Milestones[step.event]
+		if event.EventType != step.event || event.CommitSHA != commits[step.event] ||
+			milestone.Timestamp != step.date || milestone.CommitSHA != commits[step.event] {
+			t.Fatalf("event or milestone lost actual %s commit %s: event=%+v milestone=%+v", step.event, commits[step.event], event, milestone)
+		}
+	}
+	// The reverse index maps correlated code commits, not every lifecycle
+	// event. Co-commit correlation covers the actual claim/close edits here.
+	for _, event := range []string{"claimed", "closed"} {
+		if !reflect.DeepEqual(report.CommitIndex[commits[event]], []string{"BV-123"}) {
+			t.Fatalf("reverse lookup lost the %s code commit %s: %v", event, commits[event], report.CommitIndex)
+		}
+	}
+	want := map[string]any{
+		"avg_cycle_time_days": float64(2),
+		"beads":               []any{map[string]any{"id": "BV-123", "claim_to_close_ns": float64(48 * time.Hour)}},
+	}
+	for _, tc := range []struct {
+		name  string
+		query string
+		valid bool
+	}{
+		{"copied", line[1], true},
+		{"missing histories envelope", `{avg_cycle_time_days: .stats.avg_cycle_time_days, beads: [.history | to_entries[] | {id: .key, claim_to_close_ns: .value.cycle_time.claim_to_close}]}`, false},
+		{"duration mistaken for seconds", `{avg_cycle_time_days: .stats.avg_cycle_time_days, beads: [.histories | to_entries[] | {id: .key, claim_to_close_ns: (.value.cycle_time.claim_to_close / 1000000000)}]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := exec.Command(jq, "-c", tc.query)
+			query.Stdin = bytes.NewReader(payload)
+			var diagnostics bytes.Buffer
+			query.Stderr = &diagnostics
+			output, err := query.Output()
+			t.Logf("jq argv=%q exit=%v stdout=%s stderr=%s want=%v valid=%v", query.Args, err, output, diagnostics.String(), want, tc.valid)
+			if err != nil {
+				if _, exited := err.(*exec.ExitError); !tc.valid && exited {
+					return
+				}
+				t.Fatalf("query failed: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(output, &got); err != nil {
+				t.Fatal(err)
+			}
+			if matches := reflect.DeepEqual(got, want); matches != tc.valid {
+				t.Fatalf("query validity=%v, got %v, want %v", tc.valid, got, want)
 			}
 		})
 	}
@@ -419,6 +589,18 @@ func TestAgentsMD_HasRCHTrustBoundary(t *testing.T) {
 // without the other fails here.
 func TestDocsParity_ReadmeBlurbMatchesGenerated(t *testing.T) {
 	readme := repoFile(t, "README.md")
+	start := strings.Index(readme, agents.BlurbStartMarker)
+	if start < 0 {
+		t.Fatalf("README is missing current blurb marker %s", agents.BlurbStartMarker)
+	}
+	end := strings.Index(readme[start:], agents.BlurbEndMarker)
+	if end < 0 {
+		t.Fatal("README blurb is missing its end marker")
+	}
+	copied := readme[start : start+end+len(agents.BlurbEndMarker)]
+	if copied != strings.TrimSpace(agents.AgentBlurb) {
+		t.Fatal("README copied blurb differs from AgentBlurb; additions and omissions must be synchronized in both directions")
+	}
 	var missing []string
 	for _, line := range strings.Split(agents.AgentBlurb, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -609,5 +791,400 @@ func TestDocsParity_KeyBindingsDocumented(t *testing.T) {
 	}
 	if len(missing) > 0 {
 		t.Fatalf("%d registered key binding(s) are not documented in README.md:\n%s", len(missing), strings.Join(missing, "\n"))
+	}
+}
+
+// TestDocsParity_ToonAdviceMatchesMeasuredSizes (bv-apal.3): the binary's own
+// agent-facing docs must not sell TOON as a uniform token saving. TOON is
+// measured smaller than JSON only for the wide --robot-graph payload and
+// 9-15% larger for the nested ones (tests/artifacts/perf/toon_vs_json.md), so
+// any --robot-docs example that advertises a saving has to name a payload the
+// artifact records as a win. The old text ("saves ~30-50% tokens", with
+// `bv robot-triage --toon` as the saving example) fails this test.
+func TestDocsParity_ToonAdviceMatchesMeasuredSizes(t *testing.T) {
+	artifact := repoFile(t, filepath.Join("tests", "artifacts", "perf", "toon_vs_json.md"))
+	// The artifact table records TOON/JSON ratios per command in the
+	// "TOON / JSON" column. A command is a documented win only when its
+	// recorded ratio is below 1.
+	wins := map[string]bool{}
+	for _, line := range strings.Split(artifact, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "| `--robot-") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(strings.TrimSpace(line), "|"), "|")
+		if len(cells) < 4 {
+			t.Fatalf("unexpected artifact row shape: %q", line)
+		}
+		command := strings.Trim(strings.TrimSpace(cells[0]), "`")
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(cells[3]), 64)
+		if err != nil {
+			t.Fatalf("unparsable TOON/JSON ratio %q for %s in row %q", cells[3], command, line)
+		}
+		wins[command] = ratio < 1.0
+		t.Logf("artifact ratio %-24s %.2f win=%v", command, ratio, ratio < 1.0)
+	}
+	if len(wins) == 0 {
+		t.Fatalf("no TOON/JSON ratio rows parsed from tests/artifacts/perf/toon_vs_json.md")
+	}
+	if !wins["--robot-graph"] {
+		t.Fatalf("artifact no longer records --robot-graph as the TOON win; refresh README and this test together")
+	}
+
+	bv := buildBvBinary(t)
+	out, err := exec.Command(bv, "--robot-docs", "all").Output()
+	if err != nil {
+		t.Fatalf("argv=%q exit=%v stdout=%s", []string{bv, "--robot-docs", "all"}, err, out)
+	}
+	var docs struct {
+		Guide struct {
+			OutputModes map[string]string `json:"output_modes"`
+		} `json:"guide"`
+		Examples []struct {
+			Description string `json:"description"`
+			Command     string `json:"command"`
+		} `json:"examples"`
+	}
+	if err := json.Unmarshal(out, &docs); err != nil {
+		t.Fatalf("decode --robot-docs all: %v\nstdout=%s", err, out)
+	}
+	modes := docs.Guide.OutputModes
+	toonBlurb, ok := modes["toon"]
+	if !ok {
+		t.Fatalf("--robot-docs no longer describes the toon output mode; modes=%v", modes)
+	}
+	t.Logf("output_modes.toon = %q", toonBlurb)
+	// An unqualified savings claim is the defect: the blurb has to name the
+	// payload shape that actually wins, not a blanket percentage.
+	if !strings.Contains(toonBlurb, "--robot-graph") {
+		t.Errorf("output_modes.toon must name the payload TOON actually shrinks (--robot-graph), got %q", toonBlurb)
+	}
+	if !strings.Contains(strings.ToLower(toonBlurb), "larger") {
+		t.Errorf("output_modes.toon must state that nested payloads are larger, got %q", toonBlurb)
+	}
+
+	// Any example whose description promises a saving must use a measured win.
+	savingWords := []string{"saves", "saving", "smaller"}
+	commandRe := regexp.MustCompile(`\b(robot-[a-z-]+)\b`)
+	for _, example := range docs.Examples {
+		if !strings.Contains(example.Command, "toon") && !strings.Contains(example.Command, "TOON") {
+			continue
+		}
+		lowerDesc := strings.ToLower(example.Description)
+		promises := false
+		for _, word := range savingWords {
+			if strings.Contains(lowerDesc, word) {
+				promises = true
+			}
+		}
+		if !promises {
+			continue
+		}
+		named := commandRe.FindStringSubmatch(example.Command)
+		if named == nil {
+			t.Errorf("TOON saving example names no robot command: %+v", example)
+			continue
+		}
+		flag := "--" + named[1]
+		if !wins[flag] {
+			t.Errorf("example %q promises a TOON saving but %s is measured at ratio >= 1 in toon_vs_json.md", example.Command, flag)
+			continue
+		}
+		t.Logf("saving example %q -> %s (measured win)", example.Command, flag)
+	}
+}
+
+// TestDocsParity_ToonFallbackDeclaresJSONOutputFormat (bv-apal.3): TOON
+// encoding shells out to the `tru` binary. When no encoder is discoverable the
+// payload falls back to JSON, and the envelope's own output_format field must
+// say so rather than claiming "toon" over JSON bytes.
+func TestDocsParity_ToonFallbackDeclaresJSONOutputFormat(t *testing.T) {
+	dir := t.TempDir()
+	writeIssuesJSONL(t, dir, "{\"id\":\"toon-1\",\"title\":\"Fallback fixture\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2}\n")
+	bv := buildBvBinary(t)
+
+	cmd := exec.Command(bv, "--robot-next", "--format", "toon")
+	cmd.Dir = dir
+	// Force TOON discovery to fail deterministically on any host. Pointing
+	// TOON_TRU_BIN at a nonexistent path short-circuits findTruBinary (it
+	// returns immediately rather than falling through to PATH or the
+	// well-known /usr/bin/tru style locations), so a host that happens to have
+	// tru installed cannot make this assert a false premise. PATH is also
+	// stripped as a second guard.
+	cmd.Env = []string{
+		"HOME=" + filepath.Join(dir, "nonexistent"),
+		"PATH=",
+		"TOON_TRU_BIN=" + filepath.Join(dir, "no-such-tru"),
+		"BV_NO_BROWSER=1", "BV_TEST_MODE=1", "TOON_STATS=1",
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("argv=%q exit=%v stderr=%s stdout=%s", cmd.Args, err, stderr.String(), out)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("expected the JSON fallback with no encoder present, got:\n%s\nstderr=%s", out, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "falling back to JSON") {
+		t.Errorf("expected the fallback warning on stderr, got %q", stderr.String())
+	}
+	var envelope struct {
+		OutputFormat string `json:"output_format"`
+	}
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("decode fallback payload: %v\nstdout=%s", err, out)
+	}
+	if envelope.OutputFormat != "json" {
+		t.Fatalf("fallback payload declares output_format=%q but the bytes are JSON; agents keying on the envelope are misled", envelope.OutputFormat)
+	}
+	t.Logf("argv=%q output_format=%q stderr=%q", cmd.Args, envelope.OutputFormat, strings.TrimSpace(stderr.String()))
+}
+
+// TestDocsParity_RobotSchemaTypesMatchRuntime (bv-apal.3): README points agents
+// at `bv --robot-schema` as "the complete contract", so a declared JSON type
+// that disagrees with what the command actually emits is a lie in the contract
+// an agent is told to trust. For each command exercised here, every schema
+// property that the real payload also carries must agree on array vs object vs
+// string vs number. The insights Cores/Slack properties were declared "object"
+// while the command emits arrays; that state fails this test.
+func TestDocsParity_RobotSchemaTypesMatchRuntime(t *testing.T) {
+	// Load only the temp fixture, not whatever tracker the host env points at.
+	for _, name := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB", "BEADS_JSONL"} {
+		t.Setenv(name, "")
+	}
+	dir := t.TempDir()
+	var fixture strings.Builder
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&fixture, "{\"id\":\"sch-%03d\",\"title\":\"Issue %d\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2}\n", i, i)
+	}
+	// A couple of dependencies so cycle/critical-path style fields are populated.
+	fmt.Fprintf(&fixture, "{\"id\":\"sch-dep\",\"title\":\"Dependent\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":1,\"dependencies\":[{\"id\":\"sch-000\",\"type\":\"blocks\"}]}\n")
+	writeIssuesJSONL(t, dir, fixture.String())
+	bv := buildBvBinary(t)
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(bv, args...)
+		cmd.Dir = dir
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("argv=%q exit=%v stderr=%s", cmd.Args, err, stderr.String())
+		}
+		return out
+	}
+
+	// A property's "type" is either a string or, for nullable fields, a list
+	// such as ["string","null"]. Accept both and treat a list as a set of
+	// permitted kinds.
+	var schema struct {
+		Commands map[string]struct {
+			Properties map[string]struct {
+				Type json.RawMessage `json:"type"`
+			} `json:"properties"`
+		} `json:"commands"`
+	}
+	permittedKinds := func(raw json.RawMessage) []string {
+		if len(raw) == 0 {
+			return nil
+		}
+		var single string
+		if err := json.Unmarshal(raw, &single); err == nil {
+			return []string{single}
+		}
+		var many []string
+		if err := json.Unmarshal(raw, &many); err == nil {
+			return many
+		}
+		return nil
+	}
+	if err := json.Unmarshal(run("--robot-schema"), &schema); err != nil {
+		t.Fatalf("decode --robot-schema: %v", err)
+	}
+	if len(schema.Commands) == 0 {
+		t.Fatal("--robot-schema declared no commands")
+	}
+
+	// jsonKind reports the JSON Schema type name for a decoded value.
+	jsonKind := func(v any) string {
+		switch v.(type) {
+		case []any:
+			return "array"
+		case map[string]any:
+			return "object"
+		case string:
+			return "string"
+		case float64, json.Number:
+			return "number"
+		case bool:
+			return "boolean"
+		case nil:
+			return "null"
+		}
+		return "unknown"
+	}
+
+	// Commands whose payload this fixture reliably populates.
+	for _, command := range []string{"robot-insights", "robot-plan", "robot-triage", "robot-alerts", "robot-graph"} {
+		declared, ok := schema.Commands[command]
+		if !ok {
+			t.Errorf("--robot-schema declares no entry for %s", command)
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(run("--"+command), &payload); err != nil {
+			t.Fatalf("decode --%s: %v", command, err)
+		}
+		checked := 0
+		for name, spec := range declared.Properties {
+			kinds := permittedKinds(spec.Type)
+			if len(kinds) == 0 {
+				continue
+			}
+			value, present := payload[name]
+			if !present {
+				// Optional/omitempty fields are not evidence of drift.
+				continue
+			}
+			actual := jsonKind(value)
+			// null means the runtime omitted a value rather than
+			// contradicting the declared type.
+			if actual == "null" {
+				continue
+			}
+			checked++
+			allowed := false
+			for _, kind := range kinds {
+				if kind == actual || (kind == "integer" && actual == "number") {
+					allowed = true
+				}
+			}
+			if !allowed {
+				t.Errorf("--%s: schema declares %q as %v but the command emits %q", command, name, kinds, actual)
+			}
+		}
+		if checked == 0 {
+			t.Errorf("--%s: no declared property was present in the real payload; the fixture or the schema entry is wrong", command)
+		}
+		t.Logf("--%s: %d declared properties checked against real output", command, checked)
+	}
+}
+
+// TestDocsParity_RobotWallProseMatchesArtifact (bv-apal.3 / bv-q0po): the
+// README's startup paragraph cites tests/artifacts/perf/robot_wall.json for
+// per-command wall times. That prose previously claimed a warm/cold split and
+// a `bv --version` figure the artifact does not contain. Rather than police
+// wording, this pins the numbers: every fact the paragraph states about the
+// artifact must be derivable from the artifact itself.
+func TestDocsParity_RobotWallProseMatchesArtifact(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "tests", "artifacts", "perf", "robot_wall.json"))
+	if err != nil {
+		t.Fatalf("read robot_wall.json: %v", err)
+	}
+	var artifact struct {
+		Go       string `json:"go"`
+		Commands []struct {
+			Command string `json:"command"`
+			MS      int    `json:"ms"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("decode robot_wall.json: %v", err)
+	}
+	if len(artifact.Commands) == 0 {
+		t.Fatal("robot_wall.json records no commands")
+	}
+
+	byCommand := map[string]int{}
+	minMS, maxMS := artifact.Commands[0].MS, artifact.Commands[0].MS
+	for _, entry := range artifact.Commands {
+		byCommand[entry.Command] = entry.MS
+		if entry.MS < minMS {
+			minMS = entry.MS
+		}
+		if entry.MS > maxMS {
+			maxMS = entry.MS
+		}
+	}
+
+	readme := repoFile(t, "README.md")
+	var paragraph string
+	for _, line := range strings.Split(readme, "\n") {
+		if strings.Contains(line, "robot_wall.json") {
+			paragraph = line
+			break
+		}
+	}
+	if paragraph == "" {
+		t.Fatal("README no longer cites tests/artifacts/perf/robot_wall.json")
+	}
+
+	// The artifact is a single pass per command. Prose must not claim a
+	// warm/cold characterisation the artifact cannot support.
+	for _, forbidden := range []string{"with warm caches", "first cold run"} {
+		if strings.Contains(paragraph, forbidden) {
+			t.Errorf("README claims %q but robot_wall.json records one run per command with no warm/cold split", forbidden)
+		}
+	}
+	// The artifact does not time `bv --version`.
+	if _, timed := byCommand["--version"]; !timed && regexp.MustCompile(`ms for \x60bv --version\x60`).MatchString(paragraph) {
+		t.Error("README gives a bv --version wall time, but robot_wall.json does not time it")
+	}
+
+	// The artifact writes "go1.25.5"; prose reads better as "Go 1.25.5", so
+	// compare on the version number rather than the exact token.
+	mustContain := map[string]string{
+		"the artifact's Go version": strings.TrimPrefix(artifact.Go, "go"),
+		"the command count":         fmt.Sprintf("%d commands", len(artifact.Commands)),
+		"the observed span":         fmt.Sprintf("%d-%d ms", minMS, maxMS),
+	}
+	for _, command := range []string{"--robot-next", "--robot-insights", "--robot-triage"} {
+		ms, ok := byCommand[command]
+		if !ok {
+			continue
+		}
+		mustContain[command+" timing"] = fmt.Sprintf("`%s` at %d ms", command, ms)
+	}
+	for what, want := range mustContain {
+		if !strings.Contains(paragraph, want) {
+			t.Errorf("README startup paragraph does not state %s (%q) as recorded in robot_wall.json", what, want)
+		}
+	}
+	t.Logf("artifact: go=%s commands=%d span=%d-%d ms", artifact.Go, len(artifact.Commands), minMS, maxMS)
+}
+
+// TestDocsParity_InstallersReportBuiltToolchain (bv-y3m9): both installers built
+// the source with the module's `toolchain` directive (go1.26.8 for v0.25.0)
+// while printing the launcher's Go version, so a user on go1.26.5 was told the
+// build used 1.26.5. The source-build path cannot run inside `go test` (it needs
+// a full network build and, on Windows, a live console), so this is a structural
+// guard on the behaviour-defining lines: each installer must derive a reported
+// build toolchain from `go version -m` on the built binary, and must not present
+// the launcher version as the build compiler. Real-host verification is recorded
+// on bv-y3m9 (install.sh via RCH; install.ps1 on Windows against a 1.26.5-launched
+// build of go1.26.8 source).
+func TestDocsParity_InstallersReportBuiltToolchain(t *testing.T) {
+	for _, tc := range []struct {
+		file      string
+		derives   string // the command that reads the real toolchain from the artifact
+		builtLine string // the report of the toolchain actually used
+		stale     string // the old wording that presented the launcher as the build Go
+	}{
+		{"install.sh", "go version -m", "Built with $built_go", "Using Go $go_version\""},
+		{"install.ps1", "go version -m $binary", "Built with $builtGo", "vendored source with Go $goVersion"},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			body := repoFile(t, tc.file)
+			if !strings.Contains(body, tc.derives) {
+				t.Errorf("%s must read the real toolchain from the built binary via %q", tc.file, tc.derives)
+			}
+			if !strings.Contains(body, tc.builtLine) {
+				t.Errorf("%s must report the toolchain actually used (%q)", tc.file, tc.builtLine)
+			}
+			if strings.Contains(body, tc.stale) {
+				t.Errorf("%s still presents the launcher Go as the build compiler (%q); it must be qualified", tc.file, tc.stale)
+			}
+		})
 	}
 }

@@ -1,12 +1,83 @@
 package analysis
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+// Freeze the complete suggestion payload across tied scores, input orders,
+// truncation boundaries and lifecycle filters. Only the generation clock is
+// removed; scores, keyword explanations and mutation actions remain exact.
+func TestDetectDuplicates_OutputParityCorpus(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "Z", Title: "alpha beta gamma delta", Status: model.StatusOpen},
+		{ID: "A", Title: "delta gamma beta alpha", Status: model.StatusOpen},
+		{ID: "M", Title: "alpha beta gamma epsilon", Status: model.StatusInProgress},
+		{ID: "B", Title: "alpha beta gamma delta", Status: model.StatusClosed},
+		{ID: "T", Title: "alpha beta gamma delta", Status: model.StatusTombstone},
+		{ID: "C", Title: "alpha beta gamma delta", Status: model.StatusClosed},
+		{ID: "D", Title: "unrelated search indexing", Status: model.StatusOpen},
+	}
+	var corpus [][]Suggestion
+	for _, reverse := range []bool{false, true} {
+		input := slices.Clone(issues)
+		if reverse {
+			slices.Reverse(input)
+		}
+		for _, ignoreClosed := range []bool{false, true} {
+			for _, threshold := range []float64{0, 0.5, 1} {
+				for _, limit := range []int{0, 1, 3, 100} {
+					config := DefaultDuplicateConfig()
+					config.IgnoreClosedVsOpen = ignoreClosed
+					config.JaccardThreshold = threshold
+					config.MaxSuggestions = limit
+					got := DetectDuplicates(input, config)
+					for i := range got {
+						got[i].GeneratedAt = time.Time{}
+					}
+					corpus = append(corpus, got)
+				}
+			}
+		}
+	}
+	data, err := json.Marshal(corpus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Captured from the eager implementation before deferring keyword display
+	// work; three independent executions produced these identical bytes.
+	const want = "066e338e1447e62901b496a379e5d9a6a69aa8e4ade7d3b1a70362d0cffd6aa8"
+	if got := fmt.Sprintf("%x", sha256.Sum256(data)); got != want {
+		t.Fatalf("duplicate suggestion payload changed: sha256=%s want %s\n%s", got, want, data)
+	}
+}
+
+func BenchmarkDetectDuplicatesDense(b *testing.B) {
+	issues := make([]model.Issue, 500)
+	for i := range issues {
+		issues[i] = model.Issue{
+			ID: fmt.Sprintf("D-%04d", i), Title: "alpha beta gamma delta",
+			Description: strings.Repeat("shared keyword description **Markdown** paragraph.\n", 8),
+			Status:      model.StatusOpen,
+		}
+	}
+	config := DefaultDuplicateConfig()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := DetectDuplicates(issues, config); len(got) != config.MaxSuggestions {
+			b.Fatalf("got %d suggestions, want %d", len(got), config.MaxSuggestions)
+		}
+	}
+}
 
 // ============================================================================
 // extractKeywords Tests
@@ -312,6 +383,60 @@ func TestDetectDuplicates_MaxSuggestions(t *testing.T) {
 	}
 }
 
+func TestDetectDuplicates_LimitedMatchesFullRanking(t *testing.T) {
+	issues := make([]model.Issue, 48)
+	for i := range issues {
+		issues[i] = model.Issue{
+			ID: fmt.Sprintf("rank-%02d", i), Status: model.StatusOpen,
+			Title:       "alpha beta gamma " + strings.Repeat("delta ", i%3),
+			Description: fmt.Sprintf("group%d token%d", i%5, i%7),
+		}
+		if i%11 == 0 {
+			issues[i].Status = model.StatusClosed
+		}
+	}
+	normalize := func(suggestions []Suggestion) string {
+		t.Helper()
+		for i := range suggestions {
+			suggestions[i].GeneratedAt = time.Time{}
+		}
+		data, err := json.Marshal(suggestions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	for _, threshold := range []float64{0.1, 0.7} {
+		config := DefaultDuplicateConfig()
+		config.JaccardThreshold = threshold
+		config.MaxSuggestions = len(issues) * len(issues)
+		// Keeping every pair then sorting supplies the complete-ranking
+		// reference independently of the bounded replacement decisions.
+		all := DetectDuplicates(issues, config)
+		if len(all) < 20 {
+			t.Fatalf("fixture has only %d candidates", len(all))
+		}
+		for order := 0; order < 3; order++ {
+			input := slices.Clone(issues)
+			if order == 1 {
+				slices.Reverse(input)
+			} else if order == 2 {
+				for i := range input {
+					input[i] = issues[(i*17)%len(issues)]
+				}
+			}
+			for _, limit := range []int{1, 2, 3, 7, 20, 63, 64, len(all), len(all) + 1} {
+				config.MaxSuggestions = limit
+				got := DetectDuplicates(input, config)
+				want := all[:min(limit, len(all))]
+				if normalize(got) != normalize(want) {
+					t.Fatalf("threshold=%g order=%d limit=%d: bounded ranking differs from complete ranking", threshold, order, limit)
+				}
+			}
+		}
+	}
+}
+
 func TestDetectDuplicates_NonPositiveMaxIsSafe(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Implement user authentication system", Status: model.StatusOpen},
@@ -322,6 +447,55 @@ func TestDetectDuplicates_NonPositiveMaxIsSafe(t *testing.T) {
 		config.MaxSuggestions = limit
 		if suggestions := DetectDuplicates(issues, config); len(suggestions) != 0 {
 			t.Fatalf("MaxSuggestions=%d returned %d suggestions", limit, len(suggestions))
+		}
+	}
+}
+
+func TestDetectDuplicates_RepeatedIDsKeepAllSourcePairs(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "alpha beta gamma", Status: model.StatusOpen},
+		{ID: "A", Title: "alpha beta delta epsilon", Status: model.StatusOpen},
+		{ID: "B", Title: "alpha beta gamma delta", Status: model.StatusOpen},
+	}
+	config := DefaultDuplicateConfig()
+	config.JaccardThreshold = 0.1
+	config.MaxSuggestions = 10
+	all := DetectDuplicates(issues, config)
+	if len(all) != 3 {
+		t.Fatalf("repeated IDs lost source pairs: got %d want 3", len(all))
+	}
+	wantScores := []float64{0.75, 0.6, 0.4}
+	wantReasons := []string{
+		"75% keyword similarity; common: alpha, beta, gamma",
+		"60% keyword similarity; common: alpha, beta, delta",
+		"40% keyword similarity; common: alpha, beta",
+	}
+	for i := range all {
+		if all[i].Confidence != wantScores[i] || all[i].Reason != wantReasons[i] {
+			t.Fatalf("pair %d lost source score/explanation: got %g %q", i, all[i].Confidence, all[i].Reason)
+		}
+	}
+	// The source pairs have distinct scores, so no unspecified equal-key
+	// ordering is asserted. Their separate keyword explanations must survive.
+	for i := range all {
+		all[i].GeneratedAt = time.Time{}
+	}
+	for _, limit := range []int{1, 2, 3, 4} {
+		config.MaxSuggestions = limit
+		got := DetectDuplicates(issues, config)
+		for i := range got {
+			got[i].GeneratedAt = time.Time{}
+		}
+		gotJSON, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantJSON, err := json.Marshal(all[:min(limit, len(all))])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotJSON) != string(wantJSON) {
+			t.Fatalf("limit=%d: repeated-ID source pair payload changed", limit)
 		}
 	}
 }

@@ -13,11 +13,13 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'precomputed-metrics', 'graph-startup', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation', 'timeline-sprints', 'timeline-performance'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
 let activeBundle = bundle;
+let layoutVariant = null;
+let historyVariant = null;
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
   '.json': 'application/json', '.wasm': 'application/wasm', '.svg': 'image/svg+xml' };
 server = http.createServer((req, res) => {
@@ -29,11 +31,43 @@ server = http.createServer((req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  if (name === '/data/history.json' && mode === 'history-loading' && historyVariant) {
+    records.push({historyRequest:req.url,variant:historyVariant});
+    res.setHeader('Content-Type', 'application/json');
+    if (historyVariant === 'stalled-headers') return;
+    if (historyVariant === 'stalled-body') { res.write('{"commits":'); return; }
+    if (historyVariant === 'missing') { res.writeHead(404); res.end('missing optional history'); return; }
+    res.end(historyVariant === 'malformed' ? '{' : '{"commits":[]}');
+    return;
+  }
   if (!file.startsWith(path.resolve(activeBundle) + path.sep) || name === brokenAsset || !fs.existsSync(file)) {
     res.writeHead(404); res.end('Required file unavailable'); return;
   }
   res.setHeader('Content-Type', mime[path.extname(file)] || 'application/octet-stream');
   let body = fs.readFileSync(file);
+  if (name === '/data/graph_layout.json' && ['layout-seeds','precomputed-metrics','graph-startup'].includes(mode) && layoutVariant) {
+    if (layoutVariant === 'stalled-headers') return;
+    if (layoutVariant === 'stalled-body') { res.write('{"positions":'); return; }
+    if (layoutVariant === 'missing') { res.writeHead(404); res.end('missing optional layout'); return; }
+    if (layoutVariant === 'malformed') { res.end('{'); return; }
+    const layout = JSON.parse(body);
+    if (layoutVariant === 'partial') delete layout.positions[Object.keys(layout.positions)[0]];
+    if (layoutVariant === 'stale-edge') layout.links[0].reverse();
+    if (layoutVariant === 'stale-node') {
+      const id = Object.keys(layout.positions)[0];
+      layout.positions['absent-from-database'] = layout.positions[id];
+      delete layout.positions[id];
+    }
+    if (layoutVariant === 'invalid-coordinate') layout.positions[Object.keys(layout.positions)[0]][0] = '100';
+    if (layoutVariant === 'metric-missing') delete layout.centrality.pagerank[Object.keys(layout.centrality.pagerank)[0]];
+    if (layoutVariant === 'metric-invalid') layout.centrality.betweenness[Object.keys(layout.centrality.betweenness)[0]] = 999;
+    if (layoutVariant === 'metric-timeout') layout.centrality.status.PageRank.state = 'timeout';
+    if (layoutVariant === 'metric-approximate') layout.centrality.status.Betweenness.reason = 'approximate';
+    if (layoutVariant === 'metric-old-version') layout.centrality.version = 0;
+    // A matching artifact with bogus metrics must never suppress real computation.
+    for (const tuple of Object.values(layout.metrics)) tuple.fill(999);
+    body = Buffer.from(JSON.stringify(layout));
+  }
   if (name === changedAsset) body = Buffer.concat([body, Buffer.from('\n// changed after export\n')]);
   if (name === '/coi-serviceworker.js' && workerRevision) {
     body = Buffer.concat([body, Buffer.from(`\n// Browser update control ${workerRevision}\n`)]);
@@ -154,7 +188,8 @@ async function click(page, selector, text) {
   for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1 }, page.session);
 }
 async function key(page, key, code = key) {
-  for (const type of ['keyDown', 'keyUp']) await send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: key === 'Enter' ? 13 : key === 'Escape' ? 27 : 0 }, page.session);
+  const codes = {Enter:13,Escape:27,Home:36,End:35,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40};
+  for (const type of ['keyDown', 'keyUp']) await send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: codes[key] || 0 }, page.session);
 }
 async function search(page, text) {
   await click(page, 'input[placeholder="Search issues..."]');
@@ -169,6 +204,684 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function timelineSprintsJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'sprint fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'sprint graph loaded');
+  await key(page, 't', 'KeyT');
+  const markers = '.timeline-sprints button';
+  const texts = await evaluate(page, `[...document.querySelectorAll('${markers}')].map(e=>e.textContent)`);
+  assert.deepEqual(texts, ['Start: Review <em>phase</em>', 'End: Review <em>phase</em>'], 'only retained boundaries appear as literal text');
+  assert.equal(await evaluate(page, `document.querySelectorAll('.timeline-sprints em').length`), 0, 'sprint names are not interpreted as markup');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await click(page, markers, texts[0]);
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 2, 'backdated source commit is selected by boundary time');
+  assert.equal(await evaluate(page, `document.querySelector('#tt-date').textContent`), 'Sep 2, 2026');
+  await click(page, markers, texts[1]);
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 5);
+  assert.equal(await evaluate(page, `document.querySelector('#tt-date').textContent`), 'Sep 6, 2026', 'date changes with boundary navigation');
+  await capture(page, 'timeline-sprints');
+  clean(page);
+  console.log(`PASS: ${page.name} sprint boundaries, backdated chronology, date updates and literal names`);
+}
+
+async function timelinePerformanceJourney(page) {
+  const history = JSON.parse(fs.readFileSync(path.join(bundle,'data/history.json'),'utf8'));
+  assert.equal(history.commits.length, 21, 'twenty real recorded transitions');
+  const readyLarge = `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 1000 && ${app}.graphReady`;
+  await waitFor(page, readyLarge, '1000 exported issues and actual graph WASM ready');
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'performance fixture worker controls page');
+  await delay(500);
+  await waitFor(page, readyLarge, 'large fixture after worker activation');
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && ${app}.graphLoadingStage === null`, 'large graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  const priorWarmup = await evaluate(page,`${app}.forceGraphModule.getGraph().warmupTicks()`);
+  await key(page,'t','KeyT');
+  await delay(500);
+  await evaluate(page, `document.querySelector('#tt-speed').focus()`);
+  await key(page,'End');
+  await key(page,'ArrowUp');
+  assert.equal(await evaluate(page,`${state}.speed`),5);
+  await evaluate(page, `(() => {
+    window.__timelinePerf={frames:[],ticks:[],paints:0};
+    const p=window.__timelinePerf, arc=CanvasRenderingContext2D.prototype.arc;
+    CanvasRenderingContext2D.prototype.arc=function(...args){if(p.active && this.canvas.isConnected)p.paints++;return arc.apply(this,args);};
+    document.addEventListener('bv-graph:timeTravelCommit',e=>{
+      if(p.active)p.ticks.push({index:e.detail.idx,at:performance.now(),nodes:${app}.forceGraphModule.getGraph().graphData().nodes.length});
+    });
+    document.querySelector('#tt-play').addEventListener('click',()=>{
+      p.active=true;p.started=performance.now();let previous=p.started;
+      const sample=t=>{if(!p.active)return;p.frames.push(t-previous);previous=t;requestAnimationFrame(sample);};
+      requestAnimationFrame(sample);
+    },{once:true});
+  })()`);
+  await send('Profiler.enable',{},page.session);
+  await send('Profiler.start',{},page.session);
+  await click(page,'#tt-play');
+  await waitFor(page,`${state}.currentIdx===20 && !${state}.playing`,'complete 5x playback',10000);
+  await evaluate(page,`new Promise(resolve=>setTimeout(resolve,Math.max(0,window.__timelinePerf.ticks.at(-1).at+250-performance.now())))`);
+  const result=await evaluate(page,`(() => {const p=window.__timelinePerf;p.active=false;p.elapsed=performance.now()-p.started;return p;})()`);
+  const profile=await send('Profiler.stop',{},page.session);
+  fs.writeFileSync(path.join(artifacts,`${page.name}-timeline.cpuprofile`),JSON.stringify(profile.profile));
+  const sorted=result.frames.filter(n=>n>=0).sort((a,b)=>a-b);
+  const percentile=q=>sorted[Math.min(sorted.length-1,Math.ceil(q*sorted.length)-1)];
+  const summary={frames:sorted.length,p95:percentile(.95),p99:percentile(.99),max:sorted.at(-1),paints:result.paints,elapsed:result.elapsed};
+  records.push({timelinePerformance:{result,summary},page:page.name});
+  console.log(`Timeline performance ${page.name}: ${JSON.stringify(summary)}`);
+  assert.equal(result.ticks.length,20,'all twenty transitions observed, no skipped steps');
+  assert.ok(result.ticks.every((t,i)=>t.index===i+1 && t.nodes===(i%2===0?950:1000)),'every recorded closure/reopen applied');
+  assert.ok(sorted.length>=120 && result.paints>=1000,'measure actual rendering throughout playback');
+  // These are browser-animation bounds, not CLI/TUI latency or physical-device claims.
+  assert.ok(summary.p95<=33.4 && summary.p99<=50,'1000-node playback frame intervals: p95 <=33.4ms, p99 <=50ms');
+  await click(page,'.timeline-close');
+  assert.equal(await evaluate(page,`${app}.forceGraphModule.getGraph().warmupTicks()`),priorWarmup,'exit restores configured layout warmup');
+  clean(page);
+  console.log(`PASS: ${page.name} 1000-node timeline playback frame budget`);
+}
+
+async function timelineAnimationJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'animation fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'animation graph loaded');
+  // Observe actual visible-canvas arcs without replacing the renderer or clock.
+  await evaluate(page, `(() => {
+    window.__paintedNode=${app}.forceGraphModule.getGraph().graphData().nodes.find(n=>n.id==='browser-detail');
+    window.__timelinePaint=[];
+    const arc=CanvasRenderingContext2D.prototype.arc;
+    CanvasRenderingContext2D.prototype.arc=function(x,y,r,...args) {
+      const n=window.__paintedNode;
+      if (this.canvas.isConnected && n && x===n.x && y===n.y) {
+        window.__timelinePaint.push({alpha:this.globalAlpha,r,at:performance.now()});
+      }
+      return arc.call(this,x,y,r,...args);
+    };
+  })()`);
+  const graph = `${app}.forceGraphModule.getGraph()`;
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await key(page, 't', 'KeyT');
+  await delay(400);
+  const appearing = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(appearing.some(p=>p.alpha>0 && p.alpha<0.9), 'actual canvas paints intermediate appearance alpha');
+  const fullRadius = Math.min(...appearing.filter(p=>p.alpha===1).map(p=>p.r));
+  assert.ok(Number.isFinite(fullRadius), 'appearance reaches full size and opacity');
+  assert.ok(appearing.some(p=>p.alpha<1 && p.r>fullRadius*1.01), 'appearing node briefly pulses above settled size');
+  await evaluate(page, `window.__timelinePaint=[]; document.querySelector('#tt-slider').focus()`);
+  await key(page, 'ArrowRight');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 1);
+  assert.equal(await evaluate(page, `${graph}.graphData().nodes.some(n=>n.id==='browser-detail')`), false, 'removed node immediately leaves interactive graph');
+  await delay(400);
+  const disappearing = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(disappearing.some(p=>p.alpha>0 && p.alpha<0.9 && p.r<fullRadius), 'removed node actually fades and shrinks on canvas');
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), true, 'redraw returns to idle policy');
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await delay(150);
+  assert.deepEqual(await evaluate(page, 'window.__timelinePaint'), [], 'no stale disappearing overlay');
+  // Reverse an unfinished appearance; it must fade from its current size.
+  await key(page, 'ArrowRight');
+  await delay(70);
+  await key(page, 'ArrowLeft');
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await delay(300);
+  const reversed = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(reversed.some(p=>p.alpha>0 && p.alpha<0.9), 'interrupted reverse scrub continues a partial fade');
+  assert.ok(reversed.every(p=>p.alpha<0.9), 'reverse scrub does not flash back to full opacity');
+  await key(page, 'ArrowRight');
+  await delay(50);
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), true, 'exit cancels transition redraw');
+  await evaluate(page, `${graph}.autoPauseRedraw(false)`);
+  await key(page, 't', 'KeyT');
+  await delay(300);
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), false, 'settling preserves an existing continuous-redraw policy');
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), false, 'exit preserves the previous redraw policy');
+  await evaluate(page, `${graph}.autoPauseRedraw(true)`);
+  await send('Emulation.setEmulatedMedia', {features:[{name:'prefers-reduced-motion',value:'reduce'}]}, page.session);
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await key(page, 't', 'KeyT');
+  await delay(100);
+  const reducedPaint = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(reducedPaint.length > 0 && reducedPaint.every(p=>p.alpha===1), 'reduced motion paints at full opacity without intermediate appearance');
+  await evaluate(page, `window.__timelinePaint=[]; document.querySelector('#tt-slider').focus()`);
+  await key(page, 'ArrowRight');
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await delay(100);
+  assert.deepEqual(await evaluate(page, 'window.__timelinePaint'), [], 'reduced motion skips disappearing overlay');
+  for (const preset of ['spread','compact']) {
+    await evaluate(page,`${app}.forceGraphModule.applyPreset('${preset}')`);
+    assert.equal(await evaluate(page,`${graph}.warmupTicks()`),0,'preset changes keep playback warmup disabled');
+    await click(page,'.timeline-close');
+    assert.equal(await evaluate(page,`${graph}.warmupTicks()`),preset==='spread'?150:50,'exit restores the newly chosen standard or custom preset');
+    await key(page,'t','KeyT');
+  }
+  records.push({timelineAnimation:{appearing,disappearing,reversed,fullRadius},page:page.name});
+  await capture(page, 'timeline-animation');
+  clean(page);
+  console.log(`PASS: ${page.name} real canvas fade/shrink, cleanup and reduced motion`);
+}
+
+async function timelineRemovalJourney(page) {
+  const history = JSON.parse(fs.readFileSync(path.join(bundle, 'data/history.json')));
+  assert.equal(history.commits.length, 7, 'actual recorded deletion/reintroduction fixture');
+  for (const i of [1, 4]) {
+    assert.deepEqual(history.commits[i].beads_removed, ['browser-detail']);
+    assert.equal(history.commits[i].beads_closed, undefined, 'removal is not completion');
+  }
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'removal fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'removal graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await key(page, 't', 'KeyT');
+  await waitFor(page, `${state}.active`, 'keyboard enters removal timeline');
+  await evaluate(page, `document.querySelector('#tt-slider').focus()`);
+  const present = ['browser-detail', 'browser-other', 'browser-root'];
+  const absent = ['browser-other', 'browser-root'];
+  const expected = [present, absent, present, absent, absent, absent, present];
+  // Native range keys exercise both directions, including closed reintroduction.
+  for (const indices of [[0,1,2,3,4,5,6], [5,4,3,2,1,0]]) {
+    for (const i of indices) {
+      if (await evaluate(page, `${state}.currentIdx`) !== i) {
+        await key(page, indices[0] === 0 ? 'ArrowRight' : 'ArrowLeft');
+      }
+      assert.equal(await evaluate(page, `${state}.currentIdx`), i);
+      assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`), expected[i], `record ${i} visibility`);
+      const links = await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().links.length`);
+      assert.equal(links, expected[i] === present ? 1 : 0, 'absent nodes have no dangling dependency links');
+    }
+  }
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.length`), 4);
+  await capture(page, 'timeline-removal');
+  clean(page);
+  console.log(`PASS: ${page.name} deletion, open/closed reintroduction, reopening and reverse replay`);
+}
+
+async function timelineBaselineJourney(page) {
+  const history = JSON.parse(fs.readFileSync(path.join(bundle, 'data/history.json')));
+  assert.equal(history.commits.length, 500, 'real export reaches retained history limit');
+  const baseline = ['browser-detail', 'browser-root'];
+  assert.deepEqual(history.initial_beads, baseline, 'observed prior open issues seed baseline');
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'baseline fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'baseline graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  const nodes = `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`;
+  await key(page, 't', 'KeyT');
+  await waitFor(page, `${state}.active`, 'keyboard enters retained timeline');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 0);
+  assert.deepEqual(await evaluate(page, nodes), baseline, 'first retained record includes older open issues, excludes closed and future creation');
+  await evaluate(page, `document.querySelector('#tt-slider').focus()`);
+  await key(page, 'End');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 499);
+  assert.deepEqual(await evaluate(page, nodes), ['browser-other', 'browser-root'], 'later creation and closure update baseline');
+  await key(page, 'Home');
+  assert.deepEqual(await evaluate(page, nodes), baseline, 'rewinding reconstructs initial visibility');
+  await click(page, '.timeline-close');
+  assert.deepEqual(await evaluate(page, nodes), ['browser-closed', 'browser-detail', 'browser-other', 'browser-root'], 'exit restores all current issues');
+  records.push({timelineBaseline:{initial:history.initial_beads,commits:history.commits.length},page:page.name});
+  await capture(page, 'timeline-baseline');
+  clean(page);
+  console.log(`PASS: ${page.name} retained baseline, later creation/closure, rewind and exit`);
+}
+
+async function timelineControlsJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'controls fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'controls graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await key(page, 't', 'KeyT');
+  await evaluate(page, `document.querySelector('#tt-slider').focus()`);
+  await key(page, 'End');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 3, 'native range End reaches final commit');
+  await key(page, 'Home');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 0, 'native range Home reaches first commit');
+  await key(page, 'ArrowRight');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 1, 'native range keys reach an intermediate commit');
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+    ['browser-other','browser-root'], 'scrubbing applies recorded closure');
+  await evaluate(page, `document.querySelector('#tt-speed').focus()`);
+  await key(page, 'End');
+  assert.equal(await evaluate(page, `${state}.speed`), 10, 'native selector chooses fastest speed');
+  await key(page, 'ArrowUp');
+  const selectedSpeed = await evaluate(page, `${state}.speed`);
+  await evaluate(page, `${app}.initForceGraphView()`);
+  const refreshed = await evaluate(page, `({speed:${state}.speed,control:document.querySelector('#tt-speed').value})`);
+  await evaluate(page, `(async () => {
+    const h=await (await fetch('./data/history.json')).json();
+    ${app}.forceGraphModule.initTimeTravel({...h,commits:h.commits.slice(0,1)});
+    ${app}.forceGraphModule.startTimeTravel();
+  })()`);
+  const single = await evaluate(page, `({index:${state}.currentIdx,slider:document.querySelector('#tt-slider').value,
+    position:document.querySelector('#tt-position').textContent})`);
+  records.push({timelineControls:{selectedSpeed,refreshed,single},page:page.name});
+  assert.deepEqual({selectedSpeed,refreshed,single},{selectedSpeed:5,refreshed:{speed:5,control:'5'},
+    single:{index:0,slider:'0',position:'1 / 1'}}, 'keyboard speed, refreshed preference and single-commit boundary agree');
+  await evaluate(page, `${app}.initForceGraphView()`);
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true);
+  await waitFor(page, `${state}.currentIdx === 3 && !${state}.playing`, '5x playback reaches end and stops', 2000);
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+    ['browser-detail','browser-other','browser-root']);
+  await capture(page, 'timeline-controls');
+  clean(page);
+  console.log(`PASS: ${page.name} native scrubber, keyboard speed, retained preference, single commit and playback completion`);
+}
+
+async function timelineJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'timeline fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'timeline graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  assert.equal(await evaluate(page, `${state}.totalCommits`), 4, 'actual exported lifecycle history loaded');
+  await key(page, 't', 'KeyT');
+  await waitFor(page, `${state}.active`, 'keyboard enters timeline');
+  const expected = [
+    ['browser-detail','browser-other','browser-root'],
+    ['browser-other','browser-root'],
+    ['browser-other','browser-root'],
+    ['browser-detail','browser-other','browser-root'],
+  ];
+  for (let idx = 0; idx < expected.length; idx++) {
+    if (idx) await click(page, '#tt-forward');
+    assert.equal(await evaluate(page, `${state}.currentIdx`), idx);
+    assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`), expected[idx],
+      'create, close, closed edit and reopen visibility follows recorded states');
+    records.push({timeline:idx,page:page.name,visible:expected[idx]});
+  }
+  await click(page, '#tt-back');
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`), expected[2]);
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${state}.active`), false);
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+    ['browser-closed','browser-detail','browser-other','browser-root'], 'exiting restores current graph');
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  await waitFor(page, `${state}.currentIdx > 0`, 'playback advances real history');
+  await click(page, '#tt-play');
+  const paused = await evaluate(page, state);
+  assert.equal(paused.playing, false);
+  await delay(1200);
+  assert.equal(await evaluate(page, `${state}.currentIdx`), paused.currentIdx, 'pause stops advancement');
+  await click(page, '#tt-start');
+  await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true, 'playback active before data replacement');
+  await evaluate(page, `(() => {
+    window.__timelineTicks=0;
+    document.addEventListener('bv-graph:timeTravelCommit',()=>window.__timelineTicks++);
+    const d=getGraphViewData();
+    ${app}.forceGraphModule.loadData(d.issues.filter(i=>i.id==='browser-other'),[],null);
+  })()`);
+  await delay(1200);
+  const replaced = await evaluate(page, `({state:${state},ticks:window.__timelineTicks,
+    nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id),
+    controls:!!document.querySelector('#time-travel-controls')})`);
+  assert.deepEqual(replaced,{state:{active:false,playing:false,currentIdx:0,totalCommits:0,speed:1},
+    ticks:0,nodes:['browser-other'],controls:false}, 'old playback cannot overwrite replacement data');
+  await evaluate(page, `${app}.initForceGraphView()`);
+  assert.equal(await evaluate(page, `${state}.totalCommits`), 4, 'fresh export history can be loaded again');
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true, 'playback active before history replacement');
+  await evaluate(page, `(() => {${app}.forceGraphModule.initTimeTravel(null);window.__timelineTicks=0;})()`);
+  await delay(1200);
+  const cleared = await evaluate(page, `({state:${state},ticks:window.__timelineTicks,
+    nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort(),
+    controls:!!document.querySelector('#time-travel-controls')})`);
+  assert.deepEqual(cleared,{state:{active:false,playing:false,currentIdx:0,totalCommits:0,speed:1},
+    ticks:0,nodes:['browser-closed','browser-detail','browser-other','browser-root'],controls:false},
+    'missing replacement history stops playback and restores the current graph');
+  await evaluate(page, `${app}.initForceGraphView()`);
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true, 'playback active before cleanup');
+  await evaluate(page, `(() => {${app}.forceGraphModule.cleanup();window.__timelineTicks=0;})()`);
+  await delay(1200);
+  const cleaned = await evaluate(page, `({state:${state},ticks:window.__timelineTicks,
+    graph:${app}.forceGraphModule.getGraph(),controls:!!document.querySelector('#time-travel-controls')})`);
+  assert.deepEqual(cleaned,{state:{active:false,playing:false,currentIdx:0,totalCommits:0,speed:1},
+    ticks:0,graph:null,controls:false}, 'cleanup cancels active playback and releases history');
+  records.push({timelineReplacement:replaced,timelineHistoryCleared:cleared,timelineCleanup:cleaned,page:page.name});
+  await capture(page, 'timeline');
+  clean(page);
+  console.log(`PASS: ${page.name} exported timeline navigation, play/pause, replacement recovery and active cleanup`);
+}
+
+async function historyLoadingJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'history fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await send('Network.setBypassServiceWorker', {bypass:true}, page.session);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'initial graph loaded');
+  await evaluate(page, `(() => {window.__historyGraphLoads=0;document.addEventListener('bv-graph:dataLoaded',()=>window.__historyGraphLoads++);})()`);
+  let loads = 0;
+  for (const variant of ['stalled-headers','empty','stalled-body','empty','malformed','missing','empty']) {
+    historyVariant = variant;
+    const requestsBefore = records.filter(r => r.historyRequest).length;
+    const start = Date.now();
+    // Start without awaiting: an unbounded request must fail our browser assertion,
+    // rather than hang the CDP evaluation waiting for the app's promise.
+    await evaluate(page, `void ${app}.initForceGraphView()`);
+    await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && !${app}.forceGraphError`,
+      `${variant}: optional history must release graph loading`, 6000);
+    loads++;
+    const requests = records.filter(r => r.historyRequest).slice(requestsBefore);
+    assert.equal(requests.length, 1, 'refresh reaches the optional history endpoint');
+    assert.equal(requests[0].variant, variant);
+    assert.equal(await evaluate(page, 'window.__historyGraphLoads'), loads, 'every refresh must actually run');
+    assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+      ['browser-closed','browser-detail','browser-other','browser-root']);
+    records.push({historyLoading:variant,page:page.name,elapsedMs:Date.now()-start,loads});
+  }
+  historyVariant = null;
+  await capture(page, 'history-loading');
+  clean(page);
+  console.log(`PASS: ${page.name} optional history stalls, malformed/missing fallback and refresh recovery`);
+}
+
+async function graphReloadJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'reload fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'initial graph loaded');
+  const metrics = `(() => {const m=${app}.forceGraphModule.getMetrics();return {
+    vectors:{...Object.fromEntries(['pagerank','betweenness','criticalPath','eigenvector','kcore','slack'].map(k=>[k,m[k] === null ? null : Array.from(m[k])])),
+      hitsHub:m.hits === null ? null : Array.from(m.hits.hub),hitsAuthority:m.hits === null ? null : Array.from(m.hits.authority)},
+    cycles:m.cycles.cycles,articulation:[...m.articulationPoints],
+    nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>({id:n.id,pagerank:n.pagerank,betweenness:n.betweenness}))};})()`;
+  const before = await evaluate(page, metrics);
+  assert.equal(before.vectors.betweenness.length, 4, 'initial real WASM metric covers four nodes');
+  for (let cycle = 0; cycle < 2; cycle++) {
+    await evaluate(page, `${app}.forceGraphModule.loadData([],[],null)`);
+    const empty = await evaluate(page, metrics);
+    assert.equal(empty.vectors.betweenness, null, 'skipped empty-graph metric must not retain old scores');
+    for (const [name, values] of Object.entries(empty.vectors)) {
+      assert.ok(values === null || values.length === 0, `${name}: no scores from the previous graph`);
+    }
+    assert.deepEqual(empty.cycles, []);
+    assert.deepEqual(empty.articulation, []);
+    assert.deepEqual(empty.nodes, []);
+    assert.equal(await evaluate(page, `${app}.forceGraphModule.getWasmGraph().nodeCount()`), 0);
+    await evaluate(page, `(() => {const d=getGraphViewData();${app}.forceGraphModule.loadData(d.issues,d.dependencies,null);})()`);
+    const restored = await evaluate(page, metrics);
+    assert.deepEqual(restored, before, 'fresh computation restores exact metrics and node scores');
+    records.push({graphReload:cycle,page:page.name,empty,restored});
+  }
+  const navigation = await evaluate(page, `(() => {
+    const m=${app}.forceGraphModule, d=getGraphViewData();
+    m.loadData(d.issues,[...d.dependencies,{issue_id:'browser-root',depends_on_id:'browser-detail',type:'blocks'}],null);
+    m.initCycleNavigator();m.highlightCycle(0,false);
+    const selected=m.getCycleNavigatorState();
+    m.loadData(d.issues,d.dependencies,null);
+    const afterReload=m.getCycleNavigatorState();
+    m.resetCycleNavigator();
+    window.__oldPathEvents=[];
+    for(const type of ['criticalPathStep','criticalPathComplete']) document.addEventListener('bv-graph:'+type,e=>window.__oldPathEvents.push({type,detail:e.detail}));
+    const path=m.animateCriticalPath(true);
+    m.loadData(d.issues,d.dependencies,null);
+    window.__oldPathEvents=[];
+    return {selected,afterReload,path};
+  })()`);
+  assert.equal(navigation.selected.active,true);
+  assert.equal(navigation.selected.cycleCount,1);
+  assert.deepEqual([...navigation.selected.currentCycle].sort(),['browser-detail','browser-root']);
+  assert.ok(navigation.path?.path.length >= 2, 'real critical path animation started');
+  await delay(1000); // Includes both traversal ticks and the delayed completion callback.
+  const afterPath = await evaluate(page, `({state:${app}.forceGraphModule.getCriticalPathState(),events:window.__oldPathEvents})`);
+  records.push({navigationReload:navigation,afterPath,page:page.name});
+  assert.deepEqual({cycle:navigation.afterReload,path:afterPath}, {
+    cycle:{active:false,cycleCount:0,currentIndex:0,currentCycle:[],currentPath:''},
+    path:{state:{active:false,path:[],length:0,currentStep:0},events:[]}
+  }, 'graph replacement drops old cycle IDs and cancels old critical-path callbacks');
+  const cleanup = await evaluate(page, `(() => {
+    const m=${app}.forceGraphModule,d=getGraphViewData();
+    m.loadData(d.issues,[...d.dependencies,{issue_id:'browser-root',depends_on_id:'browser-other',type:'blocks'},
+      {issue_id:'browser-other',depends_on_id:'browser-root',type:'blocks'}],null);
+    m.initCycleNavigator();m.highlightCycle(0,false);
+    const selected=m.getCycleNavigatorState();
+    const next=m.nextCycle(),prev=m.prevCycle();
+    m.cleanup();
+    return {selected,next,prev,after:m.getCycleNavigatorState(),graph:m.getGraph(),path:m.getCriticalPathState()};
+  })()`);
+  for(const cycle of [cleanup.selected.currentCycle,cleanup.next.cycle,cleanup.prev.cycle]) {
+    assert.deepEqual([...cycle].sort(),['browser-other','browser-root'], 'new navigation uses only the replacement cycle');
+  }
+  assert.deepEqual(cleanup.after,{active:false,cycleCount:0,currentIndex:0,currentCycle:[],currentPath:''});
+  assert.equal(cleanup.graph,null);
+  assert.equal(cleanup.path.active,false);
+  records.push({navigationCleanup:cleanup,page:page.name});
+  const cleanupPath = await evaluate(page, `(async () => {
+    const m=${app}.forceGraphModule,d=getGraphViewData();
+    await m.initGraph('graph-container');
+    m.loadData(d.issues,d.dependencies,null);
+    const path=m.animateCriticalPath(true);
+    m.cleanup();
+    window.__oldPathEvents=[];
+    return path;
+  })()`);
+  assert.ok(cleanupPath?.path.length >= 2, 'real animation started immediately before cleanup');
+  await delay(1000);
+  const afterCleanup = await evaluate(page, `({state:${app}.forceGraphModule.getCriticalPathState(),events:window.__oldPathEvents,graph:${app}.forceGraphModule.getGraph()})`);
+  assert.deepEqual(afterCleanup,{state:{active:false,path:[],length:0,currentStep:0},events:[],graph:null},
+    'cleanup cancels active traversal and its delayed completion');
+  records.push({activePathCleanup:afterCleanup,page:page.name});
+  await capture(page, 'graph-reload');
+  clean(page);
+  console.log(`PASS: ${page.name} fresh metrics, replacement cycle navigation, cancelled path animation and cleanup`);
+}
+
+async function graphStartupJourney(page) {
+  const readyLarge=`typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total===1000 && ${app}.graphReady`;
+  await waitFor(page,readyLarge,'1000-node startup fixture ready');
+  await waitFor(page,'!!navigator.serviceWorker.controller','startup worker controls page');
+  await delay(500);
+  await waitFor(page,readyLarge,'startup fixture after worker activation');
+  await send('Network.setBypassServiceWorker',{bypass:true},page.session);
+  await click(page,'a[href="#/graph"]');
+  await waitFor(page,`${app}.forceGraphReady && !${app}.forceGraphLoading`,'initial graph loaded');
+  await evaluate(page,`(() => {
+    const g=${app}.forceGraphModule.getGraph(),draw=g.nodeCanvasObject();
+    g.nodeCanvasObject(function(node,...args){
+      const p=window.__startupSample;
+      if(p?.loaded && !p.paint && window.__startupNodes.has(node)
+        && Number.isFinite(node.x) && Number.isFinite(node.y))p.paint=performance.now();
+      return draw.call(this,node,...args);
+    });
+  })()`);
+  const samples={valid:[],missing:[]};
+  for(let round=0;round<5;round++) {
+    for(const variant of round%2?['missing','valid']:['valid','missing']) {
+      layoutVariant=variant;
+      await evaluate(page,`(() => {
+        window.__startupSample={started:performance.now()};
+        document.addEventListener('bv-graph:dataLoaded',e=>{
+          const p=window.__startupSample,g=${app}.forceGraphModule.getGraph();
+          p.loaded=performance.now();p.precomputed=e.detail.precomputed;
+          p.nodes=g.graphData().nodes.length;p.links=g.graphData().links.length;
+          p.warmup=g.warmupTicks();
+          window.__startupNodes=new WeakSet(g.graphData().nodes);
+        },{once:true});
+        ${app}.initForceGraphView();
+      })()`);
+      await waitFor(page,'!!window.__startupSample.paint','actual first canvas paint');
+      const result=await evaluate(page,'window.__startupSample');
+      assert.deepEqual([result.nodes,result.links,result.precomputed],[1000,900,variant==='valid'],'same full graph rendered for both startup paths');
+      samples[variant].push(result.paint-result.started);
+      records.push({graphStartup:{round,variant,result},page:page.name});
+      await waitFor(page,`!${app}.forceGraphLoading`,'startup view ready');
+    }
+  }
+  const median=a=>[...a].sort((a,b)=>a-b)[2];
+  const summary={samples,seededMedian:median(samples.valid),fallbackMedian:median(samples.missing)};
+  records.push({graphStartupSummary:summary,page:page.name});
+  console.log(`Graph startup ${page.name}: ${JSON.stringify(summary)}`);
+  assert.ok(summary.seededMedian<summary.fallbackMedian*.8,'validated seeds reduce median force-view first-paint latency by at least20%');
+  layoutVariant=null;
+  clean(page);
+  console.log(`PASS: ${page.name} measured precomputed startup benefit with full graph parity`);
+}
+
+async function precomputedMetricsJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'centrality worker controls page');
+  await delay(500);
+  await ready(page);
+  await send('Network.setBypassServiceWorker', {bypass:true}, page.session);
+  const oracle = await evaluate(page, `(() => {
+    const g=GRAPH_STATE.graph, pr=g.pagerankDefault(), bt=g.betweenness();
+    return Object.fromEntries([...GRAPH_STATE.nodeMap].map(([id,i])=>[id,{pr:pr[i],bt:bt[i]}]));
+  })()`);
+  await evaluate(page, `(() => {
+    const p=window.bvGraphWasm.DiGraph.prototype;
+    window.__centralityCalls={};
+    for(const name of ['pagerankDefault','betweenness','betweennessApprox']) {
+      const original=p[name];
+      p[name]=function(...args){window.__centralityCalls[name]=(window.__centralityCalls[name]||0)+1;return original.apply(this,args);};
+    }
+  })()`);
+  const variants = ['valid','metric-missing','metric-invalid','metric-timeout','metric-approximate','metric-old-version','stale-edge','missing','valid'];
+  for (const variant of variants) {
+    layoutVariant = variant;
+    await evaluate(page, `(() => {
+      window.__centralityCalls={};window.__centralityLoad=null;
+      document.addEventListener('bv-graph:dataLoaded',e=>{
+        window.__centralityLoad={reused:e.detail.precomputedMetrics,calls:{...window.__centralityCalls},
+          nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>({id:n.id,pr:n.pagerank,bt:n.betweenness}))};
+      },{once:true});
+    })()`);
+    if (await evaluate(page, `${app}.view !== 'graph'`)) await click(page, 'a[href="#/graph"]');
+    else await evaluate(page, `${app}.initForceGraphView()`);
+    await waitFor(page, '!!window.__centralityLoad', `${variant} centrality loaded`);
+    const result = await evaluate(page, 'window.__centralityLoad');
+    const expected = variant === 'valid' ? ['pagerank','betweenness']
+      : ['metric-missing','metric-timeout'].includes(variant) ? ['betweenness']
+      : ['metric-invalid','metric-approximate'].includes(variant) ? ['pagerank'] : [];
+    assert.deepEqual(result.reused, expected, `${variant}: only complete computed centrality is reused`);
+    assert.equal(result.calls.pagerankDefault || 0, expected.includes('pagerank') ? 0 : 1);
+    assert.equal(result.calls.betweenness || 0, expected.includes('betweenness') ? 0 : 1);
+    for (const n of result.nodes) {
+      assert.ok(Math.abs(n.pr-oracle[n.id].pr)<0.00001, `${variant}: ${n.id} PageRank agrees within algorithm convergence tolerance`);
+      assert.equal(n.bt, oracle[n.id].bt, `${variant}: exact directed betweenness agrees`);
+    }
+    records.push({centrality:{variant,result},page:page.name});
+    await waitFor(page, `!${app}.forceGraphLoading`, 'centrality view finishes');
+  }
+  clean(page);
+  layoutVariant = null;
+  console.log(`PASS: ${page.name} centrality reuse, actual avoided WASM calls, parity and fallback`);
+}
+
+async function layoutSeedsJourney(page, edgeless = false) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'layout worker controls page');
+  await delay(500);
+  await ready(page);
+  // Exercise each optional artifact response against the same real SQLite/WASM
+  // source. Bypass the worker cache so stale/corrupt origin responses reach fetch.
+  await send('Network.setBypassServiceWorker', { bypass: true }, page.session);
+  await evaluate(page, `(() => {window.__layoutHovered=null;document.addEventListener('bv-graph:nodeHover',e=>{window.__layoutHovered=e.detail?.node?.id || null;});})()`);
+  const exported = JSON.parse(fs.readFileSync(path.join(activeBundle, 'data/graph_layout.json'), 'utf8'));
+  const expected = exported.positions;
+  if (edgeless) {
+    assert.deepEqual(exported.links, [], 'edgeless exporter emits an empty array');
+    assert.equal(exported.edge_count, 0);
+    assert.equal(await evaluate(page, 'getGraphViewData().dependencies.length'), 0, 'actual SQLite graph is edgeless');
+    assert.equal(await evaluate(page, 'GRAPH_STATE.graph.edgeCount()'), 0, 'actual WASM graph is edgeless');
+  }
+  const variants = edgeless ? ['valid', 'missing', 'valid']
+    : ['valid', 'missing', 'malformed', 'partial', 'stale-edge', 'stale-node', 'invalid-coordinate', 'stalled-headers', 'stalled-body', 'valid'];
+  for (const variant of variants) {
+    layoutVariant = variant;
+    await evaluate(page, `(() => {
+      window.__layoutLoaded = null;
+      document.addEventListener('bv-graph:dataLoaded', e => {
+        const m=${app}.forceGraphModule;
+        window.__layoutLoaded = {precomputed:e.detail.precomputed,
+          nodes:m.getGraph().graphData().nodes.map(n=>({id:n.id,x:n.x,y:n.y,fx:n.fx,fy:n.fy,pagerank:n.pagerank})),
+          metrics:Object.fromEntries(Object.entries(m.getMetrics()).map(([k,v])=>[k,v !== null && v !== undefined]))};
+      }, {once:true});
+    })()`);
+    if (await evaluate(page, `${app}.view !== 'graph'`)) await click(page, 'a[href="#/graph"]');
+    else await evaluate(page, `${app}.initForceGraphView()`);
+    await waitFor(page, '!!window.__layoutLoaded', `${variant}: actual viewer graph load`);
+    const initial = await evaluate(page, 'window.__layoutLoaded');
+    assert.equal(initial.precomputed, variant === 'valid', `${variant}: accepted only matching layout`);
+    assert.equal(initial.nodes.length, 4);
+    for (const n of initial.nodes) {
+      assert.equal(n.fx, null, `${variant}: ${n.id} free on x`);
+      assert.equal(n.fy, null, `${variant}: ${n.id} free on y`);
+      assert.ok(Number.isFinite(n.pagerank) && n.pagerank !== 999, 'actual browser metric, not exported sentinel');
+      if (variant === 'valid') assert.deepEqual([n.x,n.y], expected[n.id], `${n.id}: exact exported seed at dataLoaded`);
+    }
+    for (const metric of ['pagerank','betweenness','criticalPath','eigenvector','kcore','cycles']) {
+      assert.equal(initial.metrics[metric], true, `${metric} remains computed`);
+    }
+    records.push({ layoutVariant:variant, initial });
+    await waitFor(page, `!${app}.forceGraphLoading`, 'viewer finishes graph initialization');
+    await waitFor(page, `${app}.graphLoadingStage === null`, 'simulation loading overlay completes');
+    await delay(400); // Let Alpine's 300ms leave transition finish before the next reload.
+  }
+  await delay(1000);
+  assert.ok(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.some(n=>{const p=${JSON.stringify(expected)}[n.id];return n.x!==p[0] || n.y!==p[1];})`), 'live simulation moves seeded nodes');
+  await evaluate(page, `${app}.forceGraphModule.setFilter('search','Orchid root')`);
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id)`), ['browser-root']);
+  await evaluate(page, `${app}.forceGraphModule.setFilter('search','')`);
+  await delay(1000);
+  // Movement was verified above. End physics before targeting a real canvas
+  // node so an isolated component cannot move between measurement and click.
+  await evaluate(page, `${app}.forceGraphModule.getGraph().cooldownTicks(0)`);
+  await delay(100);
+  await evaluate(page, `${app}.forceGraphModule.getGraph().zoomToFit(0,50)`);
+  await delay(100);
+  const point = await evaluate(page, `(() => {const g=${app}.forceGraphModule.getGraph();const n=g.graphData().nodes.find(n=>n.id==='browser-root');const p=g.graph2ScreenCoords(n.x,n.y);const r=document.querySelector('#graph-container canvas').getBoundingClientRect();return {x:r.x+p.x,y:r.y+p.y};})()`);
+  await evaluate(page, `(() => {window.__graphPointerEvents=[];for(const type of ['pointerdown','pointerup','click','bv-graph:nodeClick','bv-graph:backgroundClick']) document.addEventListener(type,e=>window.__graphPointerEvents.push({type,target:e.target.tagName,id:e.detail?.node?.id,x:e.clientX,y:e.clientY,buttons:e.buttons}),{capture:true});})()`);
+  await send('Input.dispatchMouseEvent', {type:'mouseMoved',...point},page.session);
+  // ForceGraph throttles its hit-test canvas; visible coordinates alone do
+  // not prove the pointer target has caught up with the last zoom.
+  await waitFor(page, `window.__layoutHovered === 'browser-root'`, 'actual graph hit-test recognizes the target node');
+  await send('Input.dispatchMouseEvent', {type:'mousePressed',...point,button:'left',buttons:1,clickCount:1},page.session);
+  await delay(50);
+  await send('Input.dispatchMouseEvent', {type:'mouseReleased',...point,button:'left',buttons:0,clickCount:1},page.session);
+  await delay(100);
+  records.push({graphPointer:await evaluate(page, 'window.__graphPointerEvents'), point, page:page.name});
+  await waitFor(page, `${app}.graphDetailNode?.id === 'browser-root'`, 'seeded graph pointer opens detail after filter');
+  const fitsContainer = `(() => {const g=${app}.forceGraphModule.getGraph();const c=document.getElementById('graph-container');return g.width()===c.clientWidth && g.height()===c.clientHeight;})()`;
+  await delay(400);
+  await waitFor(page, fitsContainer, 'graph fits container with detail open');
+  await capture(page, 'layout-seeds');
+  await click(page, 'button[title="Close detail pane (Esc)"]');
+  await waitFor(page, `!${app}.graphDetailNode`, 'close detail pane');
+  await delay(300);
+  await waitFor(page, fitsContainer, 'graph fits container after detail closes');
+  clean(page);
+  assert.ok(records.some(r=>r.serverRequest === '/data/graph_layout.json'), 'actual layout HTTP request');
+  layoutVariant = null;
+  console.log(`PASS: ${page.name} matching seeds, ${variants.length} layout cases, metrics, movement, filter and detail`);
 }
 async function blockingTypesJourney(page) {
   await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 7 && ${app}.graphReady`, 'seven workflow issues and actual graph WASM');
@@ -635,7 +1348,49 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'blocking-types') {
+  if (mode === 'graph-startup') {
+    await graphStartupJourney(desktop);
+    await send('Target.closeTarget',{targetId:desktop.target});
+    await graphStartupJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-performance') {
+    await timelinePerformanceJourney(desktop);
+    await send('Target.closeTarget',{targetId:desktop.target});
+    await timelinePerformanceJourney(await openPage('mobile-360',360));
+  } else if (mode === 'precomputed-metrics') {
+    await precomputedMetricsJourney(desktop);
+    await precomputedMetricsJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-sprints') {
+    await timelineSprintsJourney(desktop);
+    await timelineSprintsJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-animation') {
+    await timelineAnimationJourney(desktop);
+    await timelineAnimationJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-removal') {
+    await timelineRemovalJourney(desktop);
+    await timelineRemovalJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-baseline') {
+    await timelineBaselineJourney(desktop);
+    await timelineBaselineJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-controls') {
+    await timelineControlsJourney(desktop);
+    await timelineControlsJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline') {
+    await timelineJourney(desktop);
+    await timelineJourney(await openPage('mobile-360',360));
+  } else if (mode === 'history-loading') {
+    await historyLoadingJourney(desktop);
+    await historyLoadingJourney(await openPage('mobile-360',360));
+  } else if (mode === 'graph-reload') {
+    await graphReloadJourney(desktop);
+    await graphReloadJourney(await openPage('mobile-360',360));
+  } else if (mode === 'layout-seeds') {
+    await layoutSeedsJourney(desktop);
+    await layoutSeedsJourney(await openPage('mobile-360', 360));
+    if (updatedBundle) {
+      activeBundle = updatedBundle;
+      await layoutSeedsJourney(await openPage('edgeless'), true);
+    }
+  } else if (mode === 'blocking-types') {
     await blockingTypesJourney(desktop);
   } else if (mode === 'readiness') {
     await readinessJourney(desktop);

@@ -1517,7 +1517,7 @@ func main() {
 	robotByLabel := flag.String("robot-by-label", "", "Filter robot outputs by label (exact match)")
 	robotByAssignee := flag.String("robot-by-assignee", "", "Filter robot outputs by assignee (exact match)")
 	// Label subgraph scoping (bv-122)
-	labelScope := flag.StringP("label", "l", "", "Scope analysis to label's subgraph (affects --robot-insights, --robot-plan, --robot-priority)")
+	labelScope := flag.StringP("label", "l", "", "Scope analysis to label's subgraph (applies to every --robot-* command that loads issues, e.g. --robot-insights, --robot-plan, --robot-priority, --robot-orphans)")
 	alertSeverity := flag.String("severity", "", "Filter robot alerts by severity (info|warning|critical)")
 	alertType := flag.String("alert-type", "", "Filter robot alerts by alert type (e.g., stale_issue)")
 	alertLabel := flag.String("alert-label", "", "Filter robot alerts by label match")
@@ -2032,6 +2032,13 @@ func main() {
 		if robotOutputFormat != "json" && robotOutputFormat != "toon" {
 			fmt.Fprintf(os.Stderr, "Invalid --format %q (expected json|toon)\n", robotOutputFormat)
 			os.Exit(2)
+		}
+		// TOON encoding shells out to the `tru` binary. Downgrade here rather than
+		// inside the encoder so the payload's own output_format field does not
+		// claim "toon" while the bytes on stdout are JSON.
+		if robotOutputFormat == "toon" && !toon.Available() {
+			fmt.Fprintln(os.Stderr, "warning: tru not available; falling back to JSON")
+			robotOutputFormat = "json"
 		}
 
 		// --robot-help lists every registered command from these registries.
@@ -7032,16 +7039,24 @@ jq -r '.recommendations[] | [.id, .score, .action] | @csv' triage.json
 type TimeTravelHistory struct {
 	GeneratedAt string             `json:"generated_at"`
 	Commits     []TimeTravelCommit `json:"commits"`
+	// InitialBeads were observed unresolved before their first retained event.
+	InitialBeads []string       `json:"initial_beads,omitempty"`
+	Sprints      []model.Sprint `json:"sprints,omitempty"`
 }
 
 // TimeTravelCommit represents a single commit in the time-travel history
 type TimeTravelCommit struct {
-	SHA         string   `json:"sha"`
-	Date        string   `json:"date"`
-	Message     string   `json:"message,omitempty"`
-	BeadsAdded  []string `json:"beads_added,omitempty"`
-	BeadsClosed []string `json:"beads_closed,omitempty"`
+	SHA          string   `json:"sha"`
+	Date         string   `json:"date"`
+	Message      string   `json:"message,omitempty"`
+	BeadsAdded   []string `json:"beads_added,omitempty"`
+	BeadsClosed  []string `json:"beads_closed,omitempty"`
+	BeadsRemoved []string `json:"beads_removed,omitempty"`
 }
+
+// timeTravelCommitLimit bounds how many tracker commits the time-travel
+// history reads. It is a variable only so tests can use a small window.
+var timeTravelCommitLimit = 500
 
 // generateHistoryForExport creates time-travel history data from git history
 func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) {
@@ -7086,101 +7101,131 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 	// the per-commit event cache. Without this the watcher re-materialized the
 	// entire blob history on every re-export. BV_NO_CACHE=1 still opts out.
 	correlation.SetDiskCacheEnabled(true)
-	// The exported history is a read path: stored confirm/reject feedback
-	// shapes it exactly as it shapes --robot-history.
+	// Load the same report as robot history. Feedback affects inferred code
+	// correlations, but the timeline below uses the recorded issue events.
 	feedbackStore := correlation.NewFeedbackStore(beadsDir)
 	if err := feedbackStore.Load(); err != nil {
 		return nil, fmt.Errorf("loading correlation feedback: %w", err)
 	}
 	correlator := correlation.NewCorrelator(cwd, beadsPath).WithFeedbackStore(feedbackStore)
 	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
-		Limit: 500, // Reasonable limit for time-travel
+		Limit: timeTravelCommitLimit,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert to time-travel format
-	// Group by commit date and track bead changes
+	// Timeline visibility follows observed issue records, not inferred code
+	// correlations or today's status. A closed issue can be reopened, and an
+	// ordinary edit to a closed record must not make it visible again.
 	commitMap := make(map[string]*TimeTravelCommit)
 
 	for beadID, history := range report.Histories {
-		for _, commit := range history.Commits {
-			ttCommit, exists := commitMap[commit.SHA]
+		for _, event := range history.Events {
+			if event.CommitSHA == "" || event.Timestamp.IsZero() {
+				continue
+			}
+			ttCommit, exists := commitMap[event.CommitSHA]
 			if !exists {
 				ttCommit = &TimeTravelCommit{
-					SHA:     commit.SHA,
-					Date:    commit.Timestamp.Format(time.RFC3339),
-					Message: commit.Message,
+					SHA:     event.CommitSHA,
+					Date:    event.Timestamp.Format(time.RFC3339),
+					Message: event.CommitMsg,
 				}
-				commitMap[commit.SHA] = ttCommit
+				commitMap[event.CommitSHA] = ttCommit
 			}
 
-			// Determine if this bead was added or modified in this commit
-			// For simplicity, we consider any commit touching a bead as "adding" it
-			// (the first time it appears in history)
-			ttCommit.BeadsAdded = append(ttCommit.BeadsAdded, beadID)
-		}
-	}
-
-	// Build map of bead ID -> latest commit SHA that touched it before/at ClosedAt.
-	// This attributes closure only to the most relevant commit, not every commit.
-	closedBeadCommit := make(map[string]string) // beadID -> commitSHA
-	for _, issue := range issues {
-		if issue.Status != model.StatusClosed || issue.ClosedAt == nil {
-			continue
-		}
-		// Find the commit closest to (but not after) the closure time
-		var bestSHA string
-		var bestDist time.Duration = -1
-		for sha, commit := range commitMap {
-			for _, id := range commit.BeadsAdded {
-				if id != issue.ID {
-					continue
+			switch event.EventType {
+			case correlation.EventCreated, correlation.EventReopened:
+				ttCommit.BeadsAdded = append(ttCommit.BeadsAdded, beadID)
+				if event.After != nil && (strings.EqualFold(strings.TrimSpace(event.After.Status), "closed") || strings.EqualFold(strings.TrimSpace(event.After.Status), "tombstone")) {
+					ttCommit.BeadsClosed = append(ttCommit.BeadsClosed, beadID)
 				}
-				commitDate, _ := time.Parse(time.RFC3339, commit.Date)
-				if commitDate.IsZero() {
-					continue
-				}
-				dist := issue.ClosedAt.Sub(commitDate)
-				if dist >= 0 && (bestDist < 0 || dist < bestDist) {
-					bestSHA = sha
-					bestDist = dist
-				}
+			case correlation.EventClosed:
+				ttCommit.BeadsClosed = append(ttCommit.BeadsClosed, beadID)
+			case correlation.EventDeleted:
+				ttCommit.BeadsRemoved = append(ttCommit.BeadsRemoved, beadID)
 			}
-		}
-		if bestSHA != "" {
-			closedBeadCommit[issue.ID] = bestSHA
 		}
 	}
 
 	// Convert map to sorted slice
 	var commits []TimeTravelCommit
 	for _, commit := range commitMap {
-		// Deduplicate beads_added
-		seen := make(map[string]bool)
-		var dedupedAdded []string
-		for _, id := range commit.BeadsAdded {
-			if !seen[id] {
-				seen[id] = true
-				dedupedAdded = append(dedupedAdded, id)
-				if closedBeadCommit[id] == commit.SHA {
-					commit.BeadsClosed = append(commit.BeadsClosed, id)
-				}
-			}
-		}
-		commit.BeadsAdded = dedupedAdded
+		sort.Strings(commit.BeadsAdded)
+		sort.Strings(commit.BeadsClosed)
+		sort.Strings(commit.BeadsRemoved)
 		commits = append(commits, *commit)
 	}
 
-	// Sort commits by date
+	// Keep Git ancestry order, including equal or backdated author timestamps.
+	// Sorting timestamps or hashes can replay a close before its creation.
+	// Rank every commit reachable from HEAD rather than re-walking the tracker
+	// path. A second path walk does not select the same commits as the
+	// extractor: a bounded walk in topological order is a different set from
+	// the extractor's date-ordered window once a side branch that touched the
+	// tracker is merged, and --follow switches to a renamed tracker's old name
+	// at a point that depends on walk order, so an older side branch that
+	// edited the old name can be dropped. Every extracted commit is reachable
+	// from HEAD, so each one has a rank. Reverse by rank afterward.
+	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "HEAD")
+	orderCmd.Dir = cwd
+	orderOutput, err := orderCmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ordering timeline commits: %w", err)
+	}
+	order := make(map[string]int)
+	for i, sha := range strings.Fields(string(orderOutput)) {
+		order[sha] = -i
+	}
+	for _, commit := range commits {
+		if _, ok := order[commit.SHA]; !ok {
+			return nil, fmt.Errorf("timeline commit %s missing from source history", commit.SHA)
+		}
+	}
 	sort.Slice(commits, func(i, j int) bool {
-		return commits[i].Date < commits[j].Date
+		return order[commits[i].SHA] < order[commits[j].SHA]
+	})
+
+	var initialBeads []string
+	for beadID, history := range report.Histories {
+		var first *correlation.BeadEvent
+		for i := range history.Events {
+			event := &history.Events[i]
+			if _, ok := commitMap[event.CommitSHA]; !ok {
+				continue
+			}
+			if first == nil || order[event.CommitSHA] < order[first.CommitSHA] {
+				first = event
+			}
+		}
+		// A later observation or the current issue status cannot fill an unknown
+		// boundary. Only the first retained, successfully parsed transition can.
+		if first == nil || !first.TransitionObserved || first.Before == nil {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(first.Before.Status))
+		if status != "" && status != "closed" && status != "tombstone" {
+			initialBeads = append(initialBeads, beadID)
+		}
+	}
+	sort.Strings(initialBeads)
+	sprints, err := loader.LoadSprints(cwd)
+	if err != nil {
+		return nil, fmt.Errorf("loading timeline sprints: %w", err)
+	}
+	sort.Slice(sprints, func(i, j int) bool {
+		if !sprints[i].StartDate.Equal(sprints[j].StartDate) {
+			return sprints[i].StartDate.Before(sprints[j].StartDate)
+		}
+		return sprints[i].ID < sprints[j].ID
 	})
 
 	return &TimeTravelHistory{
-		GeneratedAt: robotNow().Format(time.RFC3339),
-		Commits:     commits,
+		GeneratedAt:  robotNow().Format(time.RFC3339),
+		Commits:      commits,
+		InitialBeads: initialBeads,
+		Sprints:      sprints,
 	}, nil
 }
 
@@ -7534,7 +7579,9 @@ func newJSONRobotEncoder(w io.Writer) *json.Encoder {
 // newRobotEncoder creates an encoder for robot mode output.
 //
 // Default output is JSON. Use `--format toon` (or BV_OUTPUT_FORMAT/TOON_DEFAULT_FORMAT)
-// to emit TOON for agent-friendly token savings.
+// to emit TOON. TOON is not uniformly smaller: tests/artifacts/perf/toon_vs_json.md
+// measures it ~7% smaller than JSON for the wide --robot-graph payload and 9-15%
+// larger for nested ones, so callers should check --stats for their own payload.
 func newRobotEncoder(w io.Writer) robotEncoder {
 	if robotOutputFormat == "toon" {
 		return &toonRobotEncoder{w: w}
@@ -7783,7 +7830,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-orphans": {
 			Flag: "--robot-orphans", Description: "Orphan commit candidates that should be linked to beads.",
 			KeyFields:   []string{"git_range", "stats.candidate_count", "candidates", "candidates[].probable_beads", "by_bead"},
-			Params:      []string{"--orphans-min-score 0-100"},
+			Params:      []string{"--orphans-min-score 0-100", "--label <label>"},
 			NeedsIssues: true,
 			NeedsGit:    true,
 		},
@@ -8143,7 +8190,7 @@ func generateRobotDocs(topic string) map[string]interface{} {
 		"data_source": ".beads/beads.jsonl, .beads/issues.jsonl, or BEADS_DB plus git history (correlations)",
 		"output_modes": map[string]string{
 			"json": "Default structured output",
-			"toon": "Token-optimized notation (saves ~30-50% tokens)",
+			"toon": "Tabular notation; measured smaller than JSON only for wide payloads such as --robot-graph (~7%), and 9-15% larger for nested ones (--robot-triage, --robot-plan, --robot-insights, --robot-label-health). See tests/artifacts/perf/toon_vs_json.md and check --stats before adopting it.",
 		},
 		"agent_intent_aliases": agentIntentAliasDocs(),
 	}
@@ -8158,9 +8205,9 @@ func generateRobotDocs(topic string) map[string]interface{} {
 		{"description": "Multi-agent: top pick per parallel track", "command": "bv robot-triage-by-track --json | jq '.triage.recommendations_by_track[].top_pick'"},
 		{"description": "Find beads related to a specific file", "command": "bv robot-file-beads README.md --json"},
 		{"description": "Search for issues by keyword", "command": `bv robot-search "authentication" --json`},
-		{"description": "Get TOON output (saves tokens)", "command": "bv robot-triage --toon"},
+		{"description": "Get TOON output for a wide payload (measured ~7% smaller than JSON)", "command": "bv robot-graph --toon"},
 		{"description": "Use env for default format", "command": "BV_OUTPUT_FORMAT=toon bv robot-triage"},
-		{"description": "Show token savings estimate", "command": "TOON_STATS=1 bv robot-triage --toon"},
+		{"description": "Compare JSON and TOON size for this payload (TOON can be larger)", "command": "TOON_STATS=1 bv robot-triage --toon"},
 	}
 
 	envVars := robotEnvVars()
@@ -8456,9 +8503,9 @@ func generateRobotSchemas() RobotSchemas {
 				"Hubs":              map[string]interface{}{"type": "array"},
 				"Authorities":       map[string]interface{}{"type": "array"},
 				"Orphans":           map[string]interface{}{"type": "array"},
-				"Cores":             map[string]interface{}{"type": "object"},
+				"Cores":             map[string]interface{}{"type": "array"},
 				"Articulation":      map[string]interface{}{"type": "array"},
-				"Slack":             map[string]interface{}{"type": "object"},
+				"Slack":             map[string]interface{}{"type": "array"},
 				"Velocity":          map[string]interface{}{"type": "object"},
 				"status":            map[string]interface{}{"type": "object"},
 				"advanced_insights": map[string]interface{}{"type": "object"},

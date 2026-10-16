@@ -161,6 +161,77 @@ or when that release is superseded; retention/deletion follows maintainer policy
 
 ## Native installation and package stores
 
+### v0.25.1 verification (2026-09-29)
+
+Published at 17:22 UTC from `4db2f8dc` after all ten gate stages passed
+without skips on vmi1152480 (Go 1.26.8, GoReleaser 2.18.1, PowerShell 7.6.5,
+br 0.6.0, the pinned wasm-bindgen 0.2.128 and Binaryen 132). Packaging sealed
+and verified all five archives. DSR uploaded the archives, `checksums.txt`,
+the sealed receipt and an SPDX SBOM of the packaged Linux amd64 binary as a
+draft without dispatch; `SHA256SUMS` and the per-archive `.sha256` files were
+added from the sealed `checksums.txt`, giving the same 14-asset set as
+v0.25.0. Every draft asset was downloaded and byte-compared before publication.
+Homebrew `cbca153` and Scoop `c96fc70` publish the same archive hashes.
+
+Checked after publication: `install.sh` into a fresh directory on Linux amd64
+and arm64 (Debian containers) installs v0.25.1 and a tiny project gets the
+expected pick; the v0.25.0 binary's `--update --yes` moves to v0.25.1 and a
+second run reports it is up to date; the macOS arm64 archive runs and reports
+v0.25.1. Native Windows execution, native macOS amd64 and Linux arm64 hardware,
+and Nix were not run for this release.
+
+Gate-host notes from this release: the default `br` 0.7.1 fails
+`TestRobotActionRoutesLiveTrackers/db` (a read-only `br --db … show` on a fresh
+tracker exits 2 with "database is busy (recovery in progress)"), so the gate
+used br 0.6.0 from a per-run tools directory. On trj the graph-WASM rebuild
+produced a `bv_graph_bg.wasm` 8 bytes shorter than the manifest with the same
+pinned tools; vmi1152480 and hz4 reproduce it exactly. On heavily loaded hosts
+the timing-bound watch/correlation e2e tests and the benchmark stage can fail
+from contention alone. `install.sh` needs `python3` for binary installs; with
+only `jq` it falls back to a source build. (Fixed after v0.25.1: the installer
+now parses release metadata with `jq` when `python3` is missing.)
+
+### v0.25.0 verification (2026-09-12)
+
+Published at 19:39:38 UTC from `87cee258` after all ten clean-source gate
+stages passed through RCH. Packaging sealed and verified all five archives.
+DSR uploaded 14 draft assets without dispatch; every asset was downloaded and
+compared before publication, and public asset digests matched afterward.
+Homebrew `4b2e5aa` and Scoop `c06a555` publish the verified archive hashes.
+
+Native Linux amd64, macOS arm64 and Windows amd64 passed binary installation,
+capabilities, tiny-project/readiness output, update from 0.24.1, no-update and
+failed-install preservation checks. The actual packaged Linux binary passed
+the desktop/mobile/offline/update browser harness. Go proxy metadata identifies
+the tagged revision; Nix evaluation reports 0.25.0 on all four platforms.
+These checks do not establish a native source build, Homebrew/Scoop installation,
+Nix build, native macOS amd64/Linux arm64 execution, or P1 performance completion.
+`UPGRADE_LOG.md` records the commands, retained artifacts and earlier failures.
+
+On 2026-09-14, the same release source also built through strict RCH with
+Nix 2.35.2 and its pinned Go 1.26.7 on native Linux amd64. The active builder's
+namespaces confirmed sandbox isolation. The derivation's `cmd/bv` tests passed, and independent
+native checks confirmed version `v0.25.0`, capabilities JSON and the expected
+recommendation from a tiny real issue file. The executable's SHA-256 is
+`c1d288d4f1d19d6a1a05993f7b5952e714af0f48211afc1760f8d240780e2036`.
+RCH's post-build source verification then exceeded its 180-second SSH timeout,
+so this run has no completed RCH source receipt. A separate independent readback
+matched all 5,084 tracked source files to `87cee258`, including executable modes.
+This proves the observed Linux amd64 Nix build and execution, not Nix profile installation or another
+platform. Bead `bv-oonu.9` retains the build log, smoke evidence and receipt
+failure separately.
+
+On 2026-09-15, that existing store package was installed offline into a fresh,
+isolated Nix profile on Linux amd64. The active profile entry and executable
+resolved to the same store path and SHA-256 above. Invoking the profile's `bv`
+returned v0.25.0, 41 robot capabilities, and the expected diagnostic pick from
+a tiny JSONL project. That project intentionally had no tracker metadata, so
+no live claim command was expected or emitted. The check changed neither the
+user's default profile nor PATH and performed no compilation. It establishes
+existing-store profile installation, not the public GitHub-flake download path,
+profile upgrades, another native platform, or a completed RCH source receipt.
+Bead `bv-oonu.9` retains the profile manifest and native command logs.
+
 Run `tests/scripts/install_native_test.ps1` on native Windows x64 as part of
 release verification. It installs two real published releases into fresh temporary
 directories containing spaces, checks version/capabilities and a tiny Beads

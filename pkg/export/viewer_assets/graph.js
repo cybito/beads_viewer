@@ -214,6 +214,7 @@ class GraphStore {
         this.wasmGraph = null;
         this.wasmReady = false;
         this.container = null;
+        this.resizeObserver = null;
 
         // Data
         this.issues = [];
@@ -283,6 +284,9 @@ class GraphStore {
         this.dependencies = [];
         this.nodeMap.clear();
         this.nodeIndexMap.clear();
+        // A skipped or failed computation belongs to this load, not the
+        // previous graph. In particular, empty graphs skip betweenness.
+        for (const metric of Object.keys(this.metrics)) this.metrics[metric] = null;
         this.selectedNode = null;
         this.hoveredNode = null;
         this.highlightedNodes.clear();
@@ -690,7 +694,7 @@ function computeMetrics() {
 
     try {
         // PageRank (importance)
-        store.metrics.pagerank = store.wasmGraph.pagerankDefault();
+        if (!store.metrics.pagerank) store.metrics.pagerank = store.wasmGraph.pagerankDefault();
 
         // Critical path heights (depth)
         store.metrics.criticalPath = store.wasmGraph.criticalPathHeights();
@@ -703,9 +707,9 @@ function computeMetrics() {
 
         // Betweenness (bottleneck) - use approx for large graphs
         const nodeCount = store.wasmGraph.nodeCount();
-        if (nodeCount > 500) {
+        if (!store.metrics.betweenness && nodeCount > 500) {
             store.metrics.betweenness = store.wasmGraph.betweennessApprox(Math.min(100, nodeCount));
-        } else if (nodeCount > 0) {
+        } else if (!store.metrics.betweenness && nodeCount > 0) {
             store.metrics.betweenness = store.wasmGraph.betweenness();
         }
 
@@ -853,7 +857,32 @@ export async function initGraph(containerId, options = {}) {
             if (labelClusterState.active && labelClusterState.showHulls) {
                 drawClusterHulls(ctx, globalScale);
             }
+        })
+        .onRenderFramePost((ctx, globalScale) => {
+            if (!timeTravelState.active) return;
+            for (const node of timeTravelState.originalNodes) {
+                const state = timeTravelState.nodeStates.get(node.id);
+                if (state && !state.visible && timelineOpacity(state) > 0) {
+                    drawNode(node, ctx, globalScale);
+                }
+            }
         });
+
+    // Follow actual container dimensions, including the detail pane's CSS
+    // transition and viewport changes, rather than racing a fixed timeout.
+    store.resizeObserver?.disconnect();
+    const graph = store.graph;
+    const container = store.container;
+    store.resizeObserver = new ResizeObserver(() => {
+        if (store.graph !== graph) return;
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        if (width > 0 && height > 0) {
+            if (graph.width() !== width) graph.width(width);
+            if (graph.height() !== height) graph.height(height);
+        }
+    });
+    store.resizeObserver.observe(container);
 
     // Setup keyboard shortcuts
     setupKeyboardShortcuts();
@@ -868,38 +897,89 @@ export async function initGraph(containerId, options = {}) {
 // DATA LOADING
 // ============================================================================
 
-// Pre-computed layout cache
-let precomputedLayout = null;
-
 /**
- * Load pre-computed graph layout for instant rendering.
- * This fetches the compact layout file (~30KB) which contains positions and metrics.
+ * Load optional starting coordinates. Only topology affects these coordinates,
+ * so compare every node and directed blocking edge with the loaded database.
+ * Reuse only complete, validated centrality snapshots. Legacy metric tuples
+ * lack computation status and are never trusted as a computation result.
  * @returns {Promise<object|null>} Layout data or null if not available
  */
-export async function loadPrecomputedLayout() {
+export async function loadPrecomputedLayout(issues, dependencies) {
     try {
-        const response = await fetch('data/graph_layout.json');
+        const response = await fetch('data/graph_layout.json', { signal: AbortSignal.timeout(3000) });
         if (!response.ok) return null;
-        precomputedLayout = await response.json();
-        console.log(`[bv-graph] Pre-computed layout: ${precomputedLayout.node_count} nodes`);
-        return precomputedLayout;
+        return validateLayout(await response.json(), issues, dependencies);
     } catch (e) {
         console.log('[bv-graph] No pre-computed layout, will use dynamic simulation');
         return null;
     }
 }
 
+function validateLayout(layout, issues, dependencies) {
+    if (!layout || !Array.isArray(issues) || !Array.isArray(dependencies)) return null;
+    const positions = layout.positions;
+    const ids = new Set(issues.map(issue => issue.id));
+    if (!positions || typeof positions !== 'object' || Array.isArray(positions)
+        || ids.size !== issues.length || layout.node_count !== ids.size
+        || Object.keys(positions).length !== ids.size) return null;
+    for (const id of ids) {
+        const pos = Object.hasOwn(positions, id) ? positions[id] : null;
+        if (!Array.isArray(pos) || pos.length !== 2 || !pos.every(Number.isFinite)) return null;
+    }
+    const edges = dependencies.filter(isBlockingDependency)
+        .map(dep => JSON.stringify([dep.depends_on_id, dep.issue_id])).sort();
+    if (!Array.isArray(layout.links) || layout.edge_count !== edges.length
+        || layout.links.length !== edges.length) return null;
+    const links = [];
+    for (const link of layout.links) {
+        if (!Array.isArray(link) || link.length !== 2
+            || !link.every(id => typeof id === 'string')) return null;
+        links.push(JSON.stringify(link));
+    }
+    links.sort();
+    if (links.some((link, i) => link !== edges[i])) return null;
+    const nodeIDs = new Set(ids);
+    for (const dependency of dependencies.filter(isBlockingDependency)) {
+        nodeIDs.add(dependency.issue_id);
+        nodeIDs.add(dependency.depends_on_id);
+    }
+    const centrality = {};
+    const snapshot = layout.centrality;
+    if (snapshot?.version === 1) {
+        for (const [name, statusName] of [['pagerank', 'PageRank'], ['betweenness', 'Betweenness']]) {
+            const values = snapshot[name];
+            const status = snapshot.status?.[statusName];
+            if (status?.state !== 'computed' || !values || typeof values !== 'object' || Array.isArray(values)
+                || Object.keys(values).length !== nodeIDs.size) continue;
+            // Native and browser sampling use different pivots and thresholds.
+            // Only exact betweenness has the same contract in both engines.
+            if (name === 'betweenness' && status.reason === 'approximate') continue;
+            const bound = name === 'pagerank' ? 1 : nodeIDs.size * nodeIDs.size;
+            if (![...nodeIDs].every(id => Object.hasOwn(values, id) && Number.isFinite(values[id]) && values[id] >= 0 && values[id] <= bound)) continue;
+            if (name === 'pagerank' && nodeIDs.size && Math.abs(Object.values(values).reduce((sum, n) => sum + n, 0) - 1) > 0.0001) continue;
+            centrality[name] = values;
+        }
+    }
+    return { positions, links: layout.links, node_count: layout.node_count,
+        edge_count: layout.edge_count, centrality: snapshot, centralityValues: centrality };
+}
+
 /**
- * Load data with optional pre-computed layout for instant rendering.
+ * Load data with optional starting coordinates and live force simulation.
  * @param {Array} issues - Issue objects from SQLite
  * @param {Array} dependencies - Dependency objects from SQLite
  * @param {object} [layout] - Optional pre-computed layout
  */
-export function loadData(issues, dependencies, layout = precomputedLayout) {
+export function loadData(issues, dependencies, layout = null) {
+    resetTimeTravel();
     resetWhatIf();
+    resetCriticalPath();
+    resetCycleNavigator();
     store.reset();
     store.issues = issues;
     store.dependencies = dependencies;
+    // Public callers receive the same topology/status validation as fetches.
+    layout = layout ? validateLayout(layout, issues, dependencies) : null;
 
     // Build lookup maps
     issues.forEach((issue, idx) => {
@@ -907,38 +987,21 @@ export function loadData(issues, dependencies, layout = precomputedLayout) {
         store.nodeIndexMap.set(issue.id, idx);
     });
 
-    // Merge pre-computed metrics if available
-    if (layout?.metrics) {
-        issues.forEach(issue => {
-            const m = layout.metrics[issue.id];
-            if (m) {
-                issue._precomputed = {
-                    pagerank: m[0],
-                    betweenness: m[1],
-                    inDegree: m[2],
-                    outDegree: m[3],
-                    inCycle: m[4] === 1
-                };
-            }
-        });
-    }
-
-    // Build WASM graph structure (always, for cycle navigator etc.)
-    // Only skip metric computation if we have pre-computed metrics
+    const precomputedMetrics = [];
+    // Reuse validated centrality, while retaining the live graph and computing
+    // browser-specific metrics such as critical path and cycle enumeration.
     if (store.wasmReady) {
         buildWasmGraph();
-        if (!layout?.metrics) {
-            computeMetrics();
-        } else {
-            console.log('[bv-graph] Using pre-computed metrics, skipping WASM computation');
-            // Convert pre-computed cycle IDs to WASM indices for cycle navigator compatibility
-            if (layout.cycles && store.wasmGraph) {
-                const cyclesAsIndices = layout.cycles.map(cycle =>
-                    cycle.map(id => store.wasmGraph.nodeIdx(id)).filter(idx => idx !== undefined)
-                ).filter(cycle => cycle.length > 0);
-                store.metrics.cycles = { cycles: cyclesAsIndices, count: cyclesAsIndices.length };
+        const centrality = layout?.centralityValues;
+        if (store.wasmGraph && centrality) {
+            for (const name of ['pagerank', 'betweenness']) {
+                if (centrality[name]) {
+                    store.metrics[name] = Array.from({length: store.wasmGraph.nodeCount()}, (_, i) => centrality[name][store.wasmGraph.nodeId(i)]);
+                    precomputedMetrics.push(name);
+                }
             }
         }
+        computeMetrics();
     }
 
     // Build label color map for galaxy view
@@ -948,6 +1011,9 @@ export function loadData(issues, dependencies, layout = precomputedLayout) {
     const graphData = prepareGraphData(layout);
 
     // Update graph
+    // Valid starting coordinates make synchronous warmup redundant. Paint the
+    // seeded graph immediately and let subsequent frames refine the layout.
+    store.graph.warmupTicks(layout ? 0 : store.config.warmupTicks);
     store.graph.graphData(graphData);
 
     // Compute max metric values for heatmap normalization (after graph data is set)
@@ -968,6 +1034,7 @@ export function loadData(issues, dependencies, layout = precomputedLayout) {
         nodeCount: graphData.nodes.length,
         linkCount: graphData.links.length,
         metrics: store.metrics,
+        precomputedMetrics,
         precomputed: !!layout
     });
 
@@ -1018,7 +1085,6 @@ function prepareGraphData(layout = null) {
     // Enrich nodes with computed data
     nodes = nodes.map(issue => {
         const idx = store.wasmReady ? store.wasmGraph?.nodeIdx(issue.id) : undefined;
-        const pre = issue._precomputed; // Pre-computed metrics from layout
         const pos = layout?.positions?.[issue.id]; // Pre-computed position
 
         return {
@@ -1033,36 +1099,33 @@ function prepareGraphData(layout = null) {
             createdAt: issue.created_at,
             updatedAt: issue.updated_at,
 
-            // Computed metrics (prefer pre-computed)
-            pagerank: pre?.pagerank ?? (idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0),
-            betweenness: pre?.betweenness ?? (idx !== undefined && metrics.betweenness ? metrics.betweenness[idx] : 0),
+            // Metrics computed on the currently loaded graph.
+            pagerank: idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0,
+            betweenness: idx !== undefined && metrics.betweenness ? metrics.betweenness[idx] : 0,
             criticalDepth: idx !== undefined && metrics.criticalPath ? metrics.criticalPath[idx] : 0,
             eigenvector: idx !== undefined && metrics.eigenvector ? metrics.eigenvector[idx] : 0,
             kcore: idx !== undefined && metrics.kcore ? metrics.kcore[idx] : 0,
-            inCycle: pre?.inCycle ?? false,
+            inCycle: false,
 
             // Dependency counts. Prefer the active-blocker count from the
             // materialized view (issue.blocker_count / dependent_count) so
             // closed blockers don't keep their dependents looking blocked
-            // (bv-issue#143/#144). Fall back to pre-computed graph degrees,
-            // then to a raw dependency-row count.
+            // (bv-issue#143/#144). Fall back to blocking dependency-row counts.
             blockerCount: issue.blocker_count
-                ?? pre?.inDegree
-                ?? dependencies.filter(d => d.issue_id === issue.id).length,
+                ?? dependencies.filter(d => isBlockingDependency(d) && d.issue_id === issue.id).length,
             dependentCount: issue.dependent_count
-                ?? pre?.outDegree
-                ?? dependencies.filter(d => d.depends_on_id === issue.id).length,
+                ?? dependencies.filter(d => isBlockingDependency(d) && d.depends_on_id === issue.id).length,
 
-            // Position: pre-computed uses fx/fy to skip simulation
+            // Seed the simulation without pinning nodes or preventing dragging.
             x: pos ? pos[0] : undefined,
             y: pos ? pos[1] : undefined,
-            fx: pos ? pos[0] : null,
-            fy: pos ? pos[1] : null
+            fx: null,
+            fy: null
         };
     });
 
-    // Mark cycle nodes (if not from pre-computed)
-    if (!layout?.cycles && metrics.cycles?.cycles) {
+    // Mark cycle nodes from the current graph.
+    if (metrics.cycles?.cycles) {
         const cycleNodes = new Set(metrics.cycles.cycles.flat());
         nodes.forEach(node => {
             const idx = store.wasmGraph?.nodeIdx(node.id);
@@ -1154,9 +1217,13 @@ function getNodeOpacity(node) {
 }
 
 function drawNode(node, ctx, globalScale) {
-    const size = getNodeSize(node);
+    const transition = timeTravelState.active ? timeTravelState.nodeStates.get(node.id) : null;
+    const fade = transition ? timelineOpacity(transition) : 1;
+    if (fade <= 0) return;
+    const pulse = transition?.visible && fade < 1 ? 0.35 * Math.sin(Math.PI * fade) : 0;
+    const size = getNodeSize(node) * (0.2 + 0.8 * fade + pulse);
     const color = getNodeColor(node);
-    const opacity = getNodeOpacity(node);
+    const opacity = getNodeOpacity(node) * fade;
     const isHovered = store.hoveredNode?.id === node.id;
     const isSelected = store.selectedNode?.id === node.id;
     const isInConnectedSubgraph = store.connectedNodes.has(node.id);
@@ -2308,6 +2375,7 @@ export function zoomToCycle(index = cycleNavigatorState.currentIndex) {
  */
 export function resetCycleNavigator() {
     cycleNavigatorState.active = false;
+    cycleNavigatorState.cycles = [];
     cycleNavigatorState.currentIndex = 0;
     cycleNavigatorState.highlightedCycleNodes.clear();
     cycleNavigatorState.highlightedCycleEdges.clear();
@@ -2569,6 +2637,12 @@ function applyPreset(presetName) {
     // Update store config with preset values
     Object.assign(store.config, preset.config);
     store.currentPreset = presetName;
+    if (timeTravelState.active) {
+        timeTravelState.warmupTicks = store.config.warmupTicks;
+    }
+    store.graph
+        .warmupTicks(timeTravelState.active ? 0 : store.config.warmupTicks)
+        .cooldownTicks(store.config.cooldownTicks);
 
     // Update view mode if specified
     if (preset.viewMode && preset.viewMode !== store.viewMode) {
@@ -2591,8 +2665,6 @@ function applyPreset(presetName) {
                 .strength(store.config.centerStrength))
             .d3Force('y', d3.forceY()
                 .strength(store.config.centerStrength))
-            .warmupTicks(store.config.warmupTicks)
-            .cooldownTicks(store.config.cooldownTicks)
             .d3ReheatSimulation();
     }
 
@@ -2662,8 +2734,8 @@ function getDefaultExportPreset() {
 
 function setupKeyboardShortcuts() {
     document.addEventListener('keydown', (e) => {
-        // Ignore if typing in input
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        // Leave native editing and selection keys to form controls.
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
 
         switch (e.key) {
             case 'Escape':
@@ -3230,7 +3302,12 @@ export function setConfig(key, value) {
 }
 
 export function cleanup() {
+    resetTimeTravel();
     resetWhatIf();
+    resetCriticalPath();
+    resetCycleNavigator();
+    store.resizeObserver?.disconnect();
+    store.resizeObserver = null;
     store.graph?.pauseAnimation();
     hideTooltip();
     if (tooltipEl) {
@@ -3288,25 +3365,59 @@ const timeTravelState = {
     history: null,        // { commits: [{sha, date, beads_added[], beads_closed[], ...}] }
     speed: 1,
     animationFrame: null,
+    transitionFrame: null,
+    autoPauseRedraw: true,
+    warmupTicks: 0,
     lastFrameTime: 0,
     originalNodes: [],    // Snapshot of nodes before time-travel
     originalLinks: [],    // Snapshot of links before time-travel
-    nodeStates: new Map(), // node.id -> { visible, opacity, animation }
+    nodeStates: new Map(), // node.id -> { visible, from, startedAt, duration }
     controlsEl: null,
 };
+
+function timelineOpacity(state, now = performance.now()) {
+    const progress = state.duration ? Math.min(1, Math.max(0, (now - state.startedAt) / state.duration)) : 1;
+    return state.from + ((state.visible ? 1 : 0) - state.from) * progress;
+}
+
+function stopTimelineTransition() {
+    if (timeTravelState.transitionFrame !== null) {
+        cancelAnimationFrame(timeTravelState.transitionFrame);
+        timeTravelState.transitionFrame = null;
+    }
+    if (timeTravelState.active && store.graph) {
+        store.graph.autoPauseRedraw(timeTravelState.autoPauseRedraw);
+    }
+}
+
+function redrawTimelineTransition() {
+    const now = performance.now();
+    const pending = [...timeTravelState.nodeStates.values()].some(state => now < state.startedAt + state.duration);
+    if (!timeTravelState.active) {
+        stopTimelineTransition();
+        return;
+    }
+    if (!pending) {
+        // Allow one final canvas frame to clear the last disappearing pixels.
+        timeTravelState.transitionFrame = requestAnimationFrame(stopTimelineTransition);
+        return;
+    }
+    timeTravelState.transitionFrame = requestAnimationFrame(redrawTimelineTransition);
+}
 
 /**
  * Initialize time-travel with history data
  * @param {Object} history - History data from --robot-history
  */
 export function initTimeTravel(history) {
+    resetTimeTravel();
     if (!history || !history.commits || history.commits.length === 0) {
         console.warn('[TimeTravel] No history data provided');
         return false;
     }
 
-    // Sort commits by date
-    history.commits.sort((a, b) => new Date(a.date) - new Date(b.date));
+    // The exporter supplies Git ancestry order. Author timestamps can be
+    // equal or backdated, so sorting them would change lifecycle replay.
 
     timeTravelState.history = history;
     timeTravelState.currentIdx = 0;
@@ -3351,6 +3462,7 @@ function createTimelineControls() {
             <div class="timeline-scrubber">
                 <input type="range" id="tt-slider" min="0" max="100" value="0">
             </div>
+            <div class="timeline-sprints" aria-label="Sprint boundaries from current definitions"></div>
             <div class="timeline-info">
                 <span id="tt-date">--</span>
                 <span id="tt-position">0 / 0</span>
@@ -3367,6 +3479,27 @@ function createTimelineControls() {
             </div>
         </div>
     `;
+
+    controls.querySelector('#tt-speed').value = String(timeTravelState.speed);
+    controls.querySelector('#tt-slider').max = String(timeTravelState.history.commits.length - 1);
+    const commits = timeTravelState.history.commits;
+    const dated = commits.map((commit, idx) => ({idx, at: Date.parse(commit.date)}))
+        .filter(commit => Number.isFinite(commit.at)).sort((a, b) => a.at - b.at || a.idx - b.idx);
+    const markers = controls.querySelector('.timeline-sprints');
+    for (const sprint of timeTravelState.history.sprints || []) {
+        for (const [field, label] of [['start_date', 'Start'], ['end_date', 'End']]) {
+            const at = Date.parse(sprint[field]);
+            if (!Number.isFinite(at) || !dated.length || at < dated[0].at || at > dated[dated.length - 1].at) continue;
+            const target = dated.find(commit => commit.at >= at);
+            const button = document.createElement('button');
+            button.className = 'timeline-btn';
+            button.textContent = `${label}: ${sprint.name}`;
+            button.title = `${new Date(at).toISOString()} — nearest following recorded commit; current sprint definition`;
+            button.addEventListener('click', () => goToCommit(target.idx));
+            markers.appendChild(button);
+        }
+    }
+    markers.hidden = !markers.childElementCount;
 
     // Add styles
     const style = document.createElement('style');
@@ -3434,6 +3567,20 @@ function createTimelineControls() {
         }
         .timeline-scrubber {
             margin-bottom: 8px;
+        }
+        .timeline-sprints:not([hidden]) {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            max-width: 300px;
+            max-height: 100px;
+            overflow-y: auto;
+            margin-bottom: 8px;
+        }
+        .timeline-sprints button {
+            max-width: 100%;
+            overflow-wrap: anywhere;
+            font-size: 11px;
         }
         .timeline-scrubber input[type="range"] {
             width: 100%;
@@ -3506,7 +3653,7 @@ function setupTimeTravelListeners() {
 
     controls.querySelector('#tt-slider').addEventListener('input', (e) => {
         if (timeTravelState.history) {
-            const idx = Math.round((e.target.value / 100) * (timeTravelState.history.commits.length - 1));
+            const idx = Number(e.target.value);
             goToCommit(idx);
         }
     });
@@ -3524,19 +3671,27 @@ export function startTimeTravel() {
         console.warn('[TimeTravel] No history loaded');
         return;
     }
+    if (timeTravelState.active) return;
 
     // Save original state
     const graphData = store.graph?.graphData() || { nodes: [], links: [] };
     timeTravelState.originalNodes = [...graphData.nodes];
     timeTravelState.originalLinks = [...graphData.links];
     timeTravelState.nodeStates.clear();
+    timeTravelState.autoPauseRedraw = store.graph?.autoPauseRedraw() ?? true;
+    timeTravelState.warmupTicks = store.graph?.warmupTicks() ?? 0;
+    // Nodes already have positions. Re-running synchronous layout warmup on
+    // every history step blocks both controls and transition painting. Keep
+    // the normal per-frame simulation running instead.
+    store.graph?.warmupTicks(0);
 
     // Initialize all nodes as hidden
     graphData.nodes.forEach(node => {
         timeTravelState.nodeStates.set(node.id, {
             visible: false,
-            opacity: 0,
-            animation: null
+            from: 0,
+            startedAt: 0,
+            duration: 0
         });
     });
 
@@ -3555,9 +3710,28 @@ export function startTimeTravel() {
 }
 
 /**
- * Stop time-travel mode and restore original state
+ * Discard timeline state before replacing its graph or history.
+ */
+function resetTimeTravel() {
+    stopTimeTravel();
+    timeTravelState.history = null;
+    timeTravelState.currentIdx = 0;
+    timeTravelState.originalNodes = [];
+    timeTravelState.originalLinks = [];
+    timeTravelState.nodeStates.clear();
+    timeTravelState.controlsEl?.remove();
+    timeTravelState.controlsEl = null;
+}
+
+/**
+ * Stop time-travel mode and restore the current graph.
  */
 export function stopTimeTravel() {
+    stopTimelineTransition();
+    if (timeTravelState.animationFrame !== null) {
+        cancelAnimationFrame(timeTravelState.animationFrame);
+        timeTravelState.animationFrame = null;
+    }
     if (!timeTravelState.active) return;
 
     // Stop playing
@@ -3566,6 +3740,7 @@ export function stopTimeTravel() {
     }
 
     // Restore original nodes
+    store.graph?.warmupTicks(timeTravelState.warmupTicks);
     if (store.graph && timeTravelState.originalNodes.length > 0) {
         store.graph.graphData({
             nodes: timeTravelState.originalNodes,
@@ -3596,7 +3771,7 @@ function goToCommit(idx) {
     timeTravelState.currentIdx = idx;
 
     // Calculate which nodes should be visible at this point
-    const visibleNodes = new Set();
+    const visibleNodes = new Set(timeTravelState.history.initial_beads || []);
     const visibleLinks = new Set();
 
     // Walk through history up to current index
@@ -3612,18 +3787,23 @@ function goToCommit(idx) {
         if (commit.beads_closed) {
             commit.beads_closed.forEach(id => visibleNodes.delete(id));
         }
+        // Record removal is distinct from completion; either hides the node.
+        if (commit.beads_removed) {
+            commit.beads_removed.forEach(id => visibleNodes.delete(id));
+        }
     }
 
-    // Update node visibility with animation
+    // Animate from the currently rendered state, including interrupted scrubs.
+    stopTimelineTransition();
+    const now = performance.now();
+    const duration = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 250;
     const currentCommit = commits[idx];
     timeTravelState.nodeStates.forEach((state, nodeId) => {
         const shouldBeVisible = visibleNodes.has(nodeId);
-        const wasJustAdded = currentCommit.beads_added?.includes(nodeId);
-        const wasJustClosed = currentCommit.beads_closed?.includes(nodeId);
-
+        state.from = timelineOpacity(state, now);
         state.visible = shouldBeVisible;
-        state.opacity = shouldBeVisible ? 1 : 0;
-        state.animation = wasJustAdded ? 'appear' : (wasJustClosed ? 'disappear' : null);
+        state.startedAt = now;
+        state.duration = state.from === (shouldBeVisible ? 1 : 0) ? 0 : duration;
     });
 
     // Build visible links (both endpoints must be visible)
@@ -3640,6 +3820,10 @@ function goToCommit(idx) {
             nodes: visibleNodesArr,
             links: visibleLinksArr
         });
+        if (duration > 0) {
+            store.graph.autoPauseRedraw(false);
+            redrawTimelineTransition();
+        }
     }
 
     // Update UI
@@ -3678,6 +3862,9 @@ function togglePlay() {
     if (timeTravelState.playing) {
         timeTravelState.lastFrameTime = Date.now();
         playAnimation();
+    } else if (timeTravelState.animationFrame !== null) {
+        cancelAnimationFrame(timeTravelState.animationFrame);
+        timeTravelState.animationFrame = null;
     }
 
     dispatchEvent('timeTravelPlayState', { playing: timeTravelState.playing });
@@ -3721,7 +3908,7 @@ function updateTimeTravelUI() {
     // Update slider
     const slider = timeTravelState.controlsEl.querySelector('#tt-slider');
     if (slider) {
-        slider.value = (idx / (commits.length - 1)) * 100;
+        slider.value = idx;
     }
 
     // Update date

@@ -5,14 +5,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
 	"modernc.org/sqlite"
@@ -61,6 +64,185 @@ func TestSetGitHash(t *testing.T) {
 
 	if exp.gitHash != "abc123" {
 		t.Errorf("Expected git hash abc123, got %s", exp.gitHash)
+	}
+}
+
+func TestGraphLayoutDeterministicPositions(t *testing.T) {
+	issues := []*model.Issue{
+		makeTestIssue("z-root", "Root", model.StatusOpen, 2, model.TypeTask),
+		makeTestIssue("a-root", "Root", model.StatusOpen, 2, model.TypeTask),
+		makeTestIssue("child", "Child", model.StatusOpen, 2, model.TypeTask),
+	}
+	deps := []*model.Dependency{{IssueID: "child", DependsOnID: "z-root", Type: model.DepBlocks}}
+	want := map[string][2]float64{"a-root": {0, -40}, "z-root": {0, 40}, "child": {200, 0}}
+	for i := 0; i < 20; i++ {
+		issues[0], issues[2] = issues[2], issues[0]
+		dir := t.TempDir()
+		if err := NewSQLiteExporter(issues, deps, nil, nil).writeGraphLayout(dir); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var layout GraphLayout
+		if err := json.Unmarshal(data, &layout); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(layout.Positions, want) {
+			t.Fatalf("iteration %d: positions %v, want %v", i, layout.Positions, want)
+		}
+		if layout.NodeCount != 3 || layout.EdgeCount != 1 || !reflect.DeepEqual(layout.Links, [][2]string{{"z-root", "child"}}) {
+			t.Fatalf("layout topology disagrees with exported issues: %+v", layout)
+		}
+	}
+	t.Run("edgeless", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := NewSQLiteExporter(issues, nil, nil, nil).writeGraphLayout(dir); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var layout GraphLayout
+		if err := json.Unmarshal(data, &layout); err != nil {
+			t.Fatal(err)
+		}
+		if layout.Links == nil || len(layout.Links) != 0 || layout.EdgeCount != 0 || len(layout.Positions) != 3 {
+			t.Fatalf("edgeless layout must expose an empty link array: %+v", layout)
+		}
+	})
+}
+
+func TestGraphLayoutCentralityUsesExportedTopology(t *testing.T) {
+	issues := []*model.Issue{
+		makeTestIssue("a", "A", model.StatusOpen, 2, model.TypeTask),
+		makeTestIssue("b", "B", model.StatusClosed, 2, model.TypeTask),
+	}
+	deps := []*model.Dependency{
+		{IssueID: "a", DependsOnID: "b", Type: model.DepBlocks},
+		{IssueID: "b", DependsOnID: "missing", Type: model.DepBlocks},
+		{IssueID: "a", DependsOnID: "ignored", Type: model.DepRelated},
+	}
+	// Deliberately unrelated supplied stats must never become cached metrics.
+	unrelated := analysis.NewAnalyzer([]model.Issue{{ID: "other"}}).Analyze()
+	exporter := NewSQLiteExporter(issues, deps, &unrelated, nil)
+	dir := t.TempDir()
+	if err := exporter.writeGraphLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var layout GraphLayout
+	if err := json.Unmarshal(data, &layout); err != nil {
+		t.Fatal(err)
+	}
+	got := layout.Centrality
+	if got == nil || got.Version != 1 || got.Status.PageRank.State != "computed" || got.Status.Betweenness.State != "computed" {
+		t.Fatalf("missing completed centrality: %+v", got)
+	}
+	if len(got.PageRank) != 3 || len(got.Betweenness) != 3 || got.Betweenness["b"] != 1 || got.Betweenness["a"] != 0 || got.Betweenness["missing"] != 0 {
+		t.Fatalf("directed three-node chain with omitted endpoint: %+v", got)
+	}
+	if !(got.PageRank["missing"] > got.PageRank["b"] && got.PageRank["b"] > got.PageRank["a"]) {
+		t.Fatalf("prerequisite rank ordering lost: %v", got.PageRank)
+	}
+	if math.Abs(got.PageRank["a"]+got.PageRank["b"]+got.PageRank["missing"]-1) > 0.000001 {
+		t.Fatalf("rank mass not conserved: %v", got.PageRank)
+	}
+	if _, exists := got.PageRank["ignored"]; exists {
+		t.Fatal("nonblocking edge polluted centrality")
+	}
+	if _, exists := layout.Positions["missing"]; exists {
+		t.Fatal("analysis-only endpoint became a drawable issue")
+	}
+	if len(issues[0].Dependencies) != 0 {
+		t.Fatal("centrality export mutated caller issues")
+	}
+}
+
+func TestGraphLayoutFallbackLayers(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		links       [][2]string // prerequisite, dependent
+		topological []string
+		want        map[string][2]float64
+	}{
+		{
+			name:  "reachable cycle",
+			links: [][2]string{{"root", "left"}, {"root", "right"}, {"left", "right"}, {"right", "left"}, {"left", "leaf"}},
+			want:  map[string][2]float64{"root": {0, 0}, "left": {200, -40}, "right": {200, 40}, "leaf": {400, 0}},
+		},
+		{
+			name:  "shortcut",
+			links: [][2]string{{"root", "left"}, {"left", "right"}, {"root", "right"}, {"right", "leaf"}},
+			want:  map[string][2]float64{"root": {0, 0}, "left": {200, -40}, "right": {200, 40}, "leaf": {400, 0}},
+		},
+		{
+			name:  "external dependent",
+			links: [][2]string{{"root", "absent"}},
+			want:  map[string][2]float64{"leaf": {0, -120}, "left": {0, -40}, "right": {0, 40}, "root": {0, 120}},
+		},
+		{
+			name:  "rootless cycle",
+			links: [][2]string{{"left", "right"}, {"right", "left"}, {"left", "leaf"}},
+			want:  map[string][2]float64{"leaf": {0, -120}, "left": {0, -40}, "right": {0, 40}, "root": {0, 120}},
+		},
+		{
+			name:        "topological longest path preserved",
+			links:       [][2]string{{"root", "left"}, {"left", "right"}, {"root", "right"}, {"right", "leaf"}},
+			topological: []string{"root", "left", "right", "leaf"},
+			want:        map[string][2]float64{"root": {0, 0}, "left": {200, 0}, "right": {400, 0}, "leaf": {600, 0}},
+		},
+		{
+			name:        "topological external prerequisite",
+			links:       [][2]string{{"absent", "left"}},
+			topological: []string{"absent", "left", "root", "right", "leaf"},
+			want:        map[string][2]float64{"leaf": {0, -80}, "right": {0, 0}, "root": {0, 80}, "left": {200, 0}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for permutation := 0; permutation < 4; permutation++ {
+				ids := []string{"root", "left", "right", "leaf"}
+				var issues []*model.Issue
+				for i := range ids {
+					if permutation&1 != 0 {
+						i = len(ids) - 1 - i
+					}
+					issues = append(issues, makeTestIssue(ids[i], ids[i], model.StatusOpen, 2, model.TypeTask))
+				}
+				var deps []*model.Dependency
+				for i := range tc.links {
+					if permutation&2 != 0 {
+						i = len(tc.links) - 1 - i
+					}
+					link := tc.links[i]
+					deps = append(deps, &model.Dependency{IssueID: link[1], DependsOnID: link[0], Type: model.DepBlocks})
+				}
+				dir := t.TempDir()
+				var stats *analysis.GraphStats
+				if tc.topological != nil {
+					stats = &analysis.GraphStats{TopologicalOrder: tc.topological}
+				}
+				if err := NewSQLiteExporter(issues, deps, stats, nil).writeGraphLayout(dir); err != nil {
+					t.Fatal(err)
+				}
+				data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var layout GraphLayout
+				if err := json.Unmarshal(data, &layout); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(layout.Positions, tc.want) {
+					t.Errorf("permutation %d: positions %v, want %v", permutation, layout.Positions, tc.want)
+				}
+			}
+		})
 	}
 }
 

@@ -150,52 +150,80 @@ ensure_install_dir() {
 }
 
 PYTHON_CMD=""
+JSON_TOOL=""
 
-ensure_python() {
-    if [ -n "$PYTHON_CMD" ]; then
+# ensure_json_tool picks the parser for GitHub/go.dev release metadata:
+# python3 (or a python that is Python 3) first, jq otherwise. Either one is
+# enough; the jq paths below mirror the Python ones exactly.
+ensure_json_tool() {
+    if [ -n "$JSON_TOOL" ]; then
         return 0
     fi
 
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_CMD="$(command -v python3)"
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+            PYTHON_CMD="$(command -v "$candidate")"
+            JSON_TOOL="python"
+            return 0
+        fi
+    done
+
+    if command -v jq >/dev/null 2>&1; then
+        JSON_TOOL="jq"
         return 0
     fi
 
-    if command -v python >/dev/null 2>&1; then
-        PYTHON_CMD="$(command -v python)"
-        return 0
-    fi
-
-    print_error "Python 3 is required to parse GitHub release metadata."
-    print_error "Please install python3 (e.g., 'xcode-select --install' on macOS) or install jq."
+    print_error "python3 or jq is required to parse GitHub release metadata." >&2
+    print_error "Install either one (e.g. 'brew install jq', 'sudo apt install jq', or 'xcode-select --install' for python3) and re-run." >&2
     return 1
 }
 
+# fetch_latest_go_pkg prints three lines for the latest stable Go release's
+# macOS .pkg for this machine's architecture: version, download URL, SHA-256.
+# go.dev's JSON has no URL field; files are served from https://go.dev/dl/<filename>.
 fetch_latest_go_pkg() {
-    # Emits: version<newline>url (for macOS .pkg matching current arch)
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local arch
     arch="$(uname -m)"
     case "$arch" in
         arm64|aarch64) arch="arm64" ;;
         x86_64|amd64) arch="amd64" ;;
-        *) print_error "Unsupported macOS architecture for Go install: $arch"; return 1 ;;
+        *) print_error "Unsupported macOS architecture for Go install: $arch" >&2; return 1 ;;
     esac
 
-    "$PYTHON_CMD" - "$arch" <<'PY'
+    local releases
+    releases=$(curl -fsSL "https://go.dev/dl/?mode=json") || {
+        print_error "Failed to fetch Go releases from go.dev" >&2
+        return 1
+    }
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        printf '%s' "$releases" | jq -re --arg arch "$arch" '
+            (map(select(.stable == true)) | .[0]) as $rel
+            | if $rel == null then empty else
+                ([($rel.files // [])[]
+                  | select(.os == "darwin" and .arch == $arch and ((.filename // "") | endswith(".pkg")))][0]) as $pkg
+                | if $pkg == null or ($pkg.sha256 // "") == "" then empty
+                  else ($rel.version // ""), ("https://go.dev/dl/" + $pkg.filename), $pkg.sha256 end
+              end'
+        return
+    fi
+
+    GO_RELEASES_JSON="$releases" "$PYTHON_CMD" - "$arch" <<'PY'
 import json
+import os
 import sys
-import urllib.request
 
 
 def main() -> int:
     arch = sys.argv[1]
     try:
-        with urllib.request.urlopen("https://go.dev/dl/?mode=json") as resp:
-            data = json.load(resp)
-    except Exception as exc:  # noqa: BLE001
-        sys.stderr.write(f"Failed to fetch Go releases: {exc}\n")
+        data = json.loads(os.environ.get("GO_RELEASES_JSON", ""))
+    except Exception as exc:
+        sys.stderr.write(f"Failed to parse Go releases: {exc}\n")
         return 1
 
     release = next((r for r in data if r.get("stable")), None)
@@ -205,16 +233,16 @@ def main() -> int:
     version = release.get("version") or ""
     files = release.get("files") or []
     pkg = next(
-        (f for f in files if f.get("os") == "darwin" and f.get("arch") == arch and f.get("filename", "").endswith(".pkg")),
+        (f for f in files if f.get("os") == "darwin" and f.get("arch") == arch and (f.get("filename") or "").endswith(".pkg")),
         None,
     )
 
-    if not pkg:
+    if not pkg or not pkg.get("sha256"):
         return 1
 
-    url = pkg.get("url") or ""
     print(version)
-    print(url)
+    print("https://go.dev/dl/" + pkg["filename"])
+    print(pkg["sha256"])
     return 0
 
 
@@ -224,11 +252,12 @@ PY
 }
 
 install_go_from_pkg() {
-    local version url tmpdir pkg_path
+    local version="" url="" expected_sha="" actual_sha="" tmpdir pkg_path
 
-    read -r version url < <(fetch_latest_go_pkg) || return 1
+    # fetch_latest_go_pkg prints version, URL and SHA-256 on separate lines.
+    { read -r version; read -r url; read -r expected_sha; } < <(fetch_latest_go_pkg) || true
 
-    if [ -z "$version" ] || [ -z "$url" ]; then
+    if [ -z "$version" ] || [ -z "$url" ] || [ -z "$expected_sha" ]; then
         return 1
     fi
 
@@ -238,6 +267,18 @@ install_go_from_pkg() {
 
     if ! curl -fsSL "$url" -o "$pkg_path"; then
         print_error "Failed to download Go installer from $url"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # The .pkg is installed with sudo: refuse it unless it matches go.dev's checksum.
+    if command -v shasum >/dev/null 2>&1; then
+        actual_sha=$(shasum -a 256 "$pkg_path" | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+        actual_sha=$(sha256sum "$pkg_path" | awk '{print $1}')
+    fi
+    if [ -z "$actual_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then
+        print_error "Go installer checksum mismatch (expected $expected_sha, got ${actual_sha:-none}); not installing"
         rm -rf "$tmpdir"
         return 1
     fi
@@ -255,9 +296,9 @@ install_go_from_pkg() {
 }
 
 version_ge() {
-    # Returns 0 if $1 >= $2 (both are dot-separated numeric strings)
-    local IFS=.
-    local i ver1=($1) ver2=($2)
+    local i ver1 ver2
+    IFS=. read -r -a ver1 <<< "$1"
+    IFS=. read -r -a ver2 <<< "$2"
     for ((i=0; i<${#ver1[@]} || i<${#ver2[@]}; i++)); do
         local v1=${ver1[i]:-0}
         local v2=${ver2[i]:-0}
@@ -267,12 +308,37 @@ version_ge() {
     return 0
 }
 
+# select_release_asset reads one release object on stdin and prints three
+# lines: tag name, download URL, asset name. Fails when no asset matches.
 select_release_asset() {
     local platform="$1"
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local release_json
     release_json=$(cat) || return 1
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        local ext=".tar.gz" parsed
+        case "$platform" in
+            windows_*) ext=".zip" ;;
+        esac
+        parsed=$(printf '%s' "$release_json" | jq -r --arg platform "$platform" --arg ext "$ext" '
+            [(.assets // [])[]
+             | {name: (.name // ""), url: (.browser_download_url // "")}
+             | select(.url != "" and (.name | endswith($ext)))] as $candidates
+            | ([$candidates[] | select(.name | contains($platform))][0]
+               // [$candidates[] | select(.name | gsub("_"; "") | contains($platform | gsub("_"; "")))][0]
+               // {name: "", url: ""}) as $pick
+            | (.tag_name // ""), $pick.url, $pick.name') || {
+            print_error "Failed to parse release JSON" >&2
+            return 1
+        }
+        local tag="" url="" name=""
+        { read -r tag; read -r url; read -r name; } <<< "$parsed" || true
+        printf '%s\n%s\n%s\n' "$tag" "$url" "$name"
+        [ -n "$url" ]
+        return
+    fi
 
     BV_RELEASE_JSON="$release_json" "$PYTHON_CMD" - "$platform" "$BIN_NAME" <<'PY'
 import json
@@ -313,7 +379,7 @@ def main():
         return 1
     try:
         data = json.loads(release_json)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         sys.stderr.write(f"Failed to parse release JSON: {exc}\n")
         return 1
 
@@ -413,6 +479,13 @@ try_binary_install() {
     local tmp_dir
 
     print_info "Checking for pre-built binary..."
+
+    # Release metadata is parsed with python3 or jq; without either we cannot
+    # pick a release asset.
+    if ! ensure_json_tool; then
+        print_warn "Skipping the pre-built binary: neither python3 nor jq is installed."
+        return 1
+    fi
 
     # Get latest release info
     local release_json
@@ -571,7 +644,7 @@ try_go_install() {
         exit 1
     fi
 
-    print_info "Using Go $go_version"
+    print_info "Using Go $go_version to launch the build (the module's toolchain directive may select another)"
 
     local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0
     tmp_dir=$(make_tmp_dir)
@@ -608,6 +681,16 @@ try_go_install() {
     if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 go build -o "$build_output" "./cmd/$BIN_NAME"); then
         print_error "Go build failed."
         exit 1
+    fi
+
+    # Report the toolchain the build actually used, which the module's `toolchain`
+    # directive can make differ from the launcher's Go reported above.
+    # Match the go<version> token on the first line regardless of its position,
+    # so a build path containing spaces cannot shift the field index.
+    local built_go
+    built_go=$(go version -m "$build_output" 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^go[0-9]/){print $i; exit}}')
+    if [ -n "$built_go" ]; then
+        print_info "Built with $built_go"
     fi
 
     ensure_install_dir "$INSTALL_DIR"

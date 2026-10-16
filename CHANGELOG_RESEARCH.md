@@ -12,7 +12,122 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 16 post-release update
+
+Coverage: all non-merge commit subjects and file summaries in
+`5614d89e..04a0107b`, grouped into graph/timeline, tree snapshots, terminal
+integration, history caching, and documentation. Implementation diffs, current
+consumers, real-browser records, and original `bv-643f`/`bv-z38b` criteria were
+reviewed; tracker-only commits add no capability credit. Representative commit
+links resolve to pushed Git objects. Live GitHub metadata still reports
+v0.25.0 published at 2026-09-12T19:39:38Z, so these changes are Unreleased.
+
+Final standard-version strict RCH build, vet, full Go suite and focused cache
+race checks pass in `/tmp/bv-standard-final-tests-20260916.log` (SHA-256
+`c653f204167b66b0f04b50906f2301452a3c00bb04fcbc79cbe670f313c8d20e`).
+Nonverbose package success does not establish execution of environment-gated
+live-tracker or native-terminal tests. UBS remains nonzero with reviewed false
+positives and existing full-file findings; it is not a clean scanner result.
+Actual full browser journeys pass in `/tmp/bv-final-general-browser-20260916.log`;
+specialized final playback evidence is in
+`/tmp/bv-timeline-performance-frozen-20260916.log`. Both viewport records include
+all twenty transitions and the final animation tail. Earlier failed attempts
+remain retained. The changelog's 33.3 ms p99 describes that fixture only.
+
+`bv-643f` and `bv-z38b` closed after original acceptance and independent
+source/raw-record review. The separate paired CLI/TUI matrix and native-platform
+gaps remain open. Windows background-query evidence is parser/cross-build only;
+the full Linux suite does not prove real Windows Terminal I/O. No new release,
+package publication, universal speedup, or physical-phone claim is made.
+
+## September 15 post-release update
+
+Follow-up `5614d89e` wires the existing palette helper into the two panel
+border styles. Independent source review found no output-semantic change.
+Tests compare 32 actual panel renderings against the previous styles and
+expand the helper matrix to 88 comparisons; the original seven numeric-color
+cases remain. Strict RCH on hz4 passed build, vet, the UI suite (13.275 s),
+and focused race checks (3.044 s). UBS scanned both changed files with zero
+critical findings or warnings; its optional Go tools were disabled, with
+build/vet run separately. First-party formatting is clean.
+
+The five-run ANSI256/dark benchmark renders two 65×40 panels per iteration,
+excluding style construction equally from both arms. Legacy/current medians
+are 779,595/443,043 ns, 83,691/81,696 B, and 1,658/1,494 allocations. Raw log:
+`/tmp/bv-panel-verify-20260915.log`, SHA-256
+`ddbe54620d1a477390ead3cc2648bc23ad7cbe66cb7b70bb8c8f78d8023e17c5`.
+This is a steady-state panel benchmark, not an application-wide claim.
+Separate actual Unicode/1k navigation and refresh runs each collected 1,000
+samples on hz4 and passed unchanged gates at p99 24.506414/28.132545 ms;
+refresh delivered 39 snapshots. Raw records are retained in
+`/data/tmp/bv-panel-evidence-20260915`. Full performance qualification remains
+open; these targeted runs do not replace its paired matrix. Earlier checkpoint
+statements below retain their historical scope.
+
+The subsequent full current-only hz4 run passed all 36 cohorts and 36,000
+samples at the same runtime revision. Root and independent readbacks matched
+all raw-file hashes and recalculated percentiles: worst p99 34.469134 ms,
+largest sample 45.950603 ms, and 902 snapshot/Phase 2 deliveries with maxima
+17.766892/10.992415 ms. No skips or threshold changes; strict RCH exited zero.
+Evidence: `/tmp/bv-p1-current-ui-hz4-20260915-1zuz4ufd/` (run log, raw files,
+and native hash manifest). A separate pre-panel run on contended vmi126 failed
+all 36 p99 checks; its complete records remain under
+`/tmp/bv-p1-current-ui-vmi126-resume-20260915-s2xrno0_/`. The source and host
+differences preclude attributing that contrast to the panel patch. Neither
+current-only run completes the original paired qualification, and neither
+requested a sealed source-content receipt.
+
+Coverage: complete non-tracker history `v0.25.0..f513f019`, eleven commits.
+Reviewed the existing v0.25.0 publication entry, Nix instruction/verification
+diffs, duplicate detector and tests, theme conversion and tests, and the
+clock-only drift regression repair. The live GitHub API still identifies
+v0.25.0 as published on 2026-09-12T19:39:38Z; its tag resolves to `87cee258`.
+The new capabilities are therefore Unreleased, not another published version.
+
+The duplicate campaign comprises `d30cceef`, `340dc1c5`, `78b62358`,
+`cb004dce`, `f4c7310f`, and `2d57b6ae`. The changelog quantifies only the
+last bounded-selection step, using `/tmp/bv-topk-before-20260915.log` and
+`/tmp/bv-topk-after-20260915.log`: five runs each, median 42,843,184 to
+2,182,064 B/op and 232,327,096 to 30,666,439 ns/op. The original 48-case
+fingerprint, 54 limit/order/threshold comparisons, and explicit repeated-ID
+source scores/explanations passed. The remaining overlap-counting work is
+not bounded by the requested result count.
+
+`174b1d3a` precomputes reusable theme palette values. Its final tests cover
+72 ordinary profile/background/color combinations and seven supported
+out-of-range numeric cases. Label rendering uses 168 to 152 B/op and ten to
+nine allocations; timing varied across runs. The pre/post UI diagnostic did
+not establish a latency improvement, so none is claimed for this change.
+`f513f019` aligns a fixture analyzer with the existing calculator clock;
+the failed September 15 confidence probe is retained, and no threshold changed.
+
+`c938d400` corrects consumer-flake unfree configuration; `d1de341f` records
+actual Nix build/executable checks and the distinct RCH timeout. `017ea57a`
+records v0.25.0 publication already covered by the released entry. Beads
+`bv-apal.1` and `bv-oonu.9` remain incomplete. The latest single UI cohort's
+33.641960 ms p99 and seven refreshes do not replace the full paired matrix.
+The requested current-only UI sweep on the reference host was refused before
+execution because hz4 had less than 5% disk space free. A complete diagnostic
+sweep was reassigned to vmi126 with the same fixtures, samples, and limits.
+It receives no credit before its result, and a different-host, current-only
+run cannot itself complete the original paired matrix.
+
 ## September 12 release preparation
+
+Publication completed at **2026-09-12T19:39:38Z**, tag `v0.25.0`, source
+`87cee25886915ab1d072d807abc234b743899f7c`. GitHub release API reports 14 assets;
+every public digest matches the local sealed set and every draft asset was
+downloaded and compared before publication. The Go proxy identifies the same
+tagged revision. Homebrew `4b2e5aa` and Scoop `c06a555` publish matching hashes.
+The clean gate passed all ten stages in 1833 seconds; package-time archive
+verification passed. Later standalone verification attempts were refused by
+RCH memory-pressure admission, with no local fallback; they do not replace or
+invalidate the completed package verification. Native Linux/macOS/Windows
+binary installer and update checks and packaged-browser journeys passed.
+Detailed retained paths and limits are recorded in `UPGRADE_LOG.md`.
+
+The following paragraphs preserve the preparation history and its intermediate
+failures; pending statements below describe those earlier checkpoints.
 
 Saved claim execution requires br 0.6.0 or newer: the live gate exposed the
 older worker tracker's missing deferral guard. The official 0.6.0 binary passed

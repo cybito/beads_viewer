@@ -2,10 +2,12 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
-commits through [`b0ce5669`](https://github.com/Dicklesworthstone/beads_viewer/commit/b0ce5669), including the September 10 canonical-source and Cass
-repairs, September 11 performance work, and September 12 dependency campaign.
-The v0.25.0 candidate remains unpublished until its complete release gate passes.
+Scope window: this update verifies `v0.25.1..v0.25.2` (installer and
+terminal-layout fixes) on top of the `v0.25.0..v0.25.1` audit, which covered the
+September 14–16 graph, timeline, duplicate-detection and history-cache work and
+the September 17–29 source-selection, correlation, search, agent-file and
+layout fixes. Each release was published after its complete clean-source
+release gate passed.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -16,7 +18,9 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
-| v0.25.0 (candidate) | — | Not yet published | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
+| [`v0.25.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.2) | 2026-09-30 | GitHub Release | Every view and the footer stay inside the terminal; `install.sh` installs the release binary with only `jq`, and its Go `.pkg` fallback works and checks the download. |
+| [`v0.25.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.1) | 2026-09-29 | GitHub Release | Views laid out beside the shortcuts sidebar, restored time-travel export, tracker-source selection and correlation fixes, and the September graph/timeline work. |
+| [`v0.25.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.0) | 2026-09-12 | GitHub Release | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
 | [`v0.24.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.1) | 2026-09-08 | GitHub Release | Reuse loaded source hashes and avoid waiting for a busy analysis-cache writer. |
 | [`v0.24.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.0) | 2026-09-07 | GitHub Release | Latency campaign across analysis, loader and TUI, graph-navigation and causality repairs, release-gate isolation, and the x/text GO-2026-5970 dependency fix. |
 | [`v0.23.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.23.0) | 2026-09-04 | GitHub Release | Reality Check hardening sweep, 10-stage release gate, proactive drift alerts, typed env registry, docgen, and full tracker completion. |
@@ -27,7 +31,223 @@ the latest tag, including installer changes usable with already released binarie
 
 ---
 
-## v0.25.0 — release candidate
+## v0.25.2 — 2026-09-30
+
+### Fixes
+
+- **Views and the footer stay inside the terminal.** With the shortcuts
+  sidebar off (the default), nothing stopped a view from drawing more rows or
+  columns than the terminal has, so the footer could be pushed off screen and
+  long lines wrapped. Insights drew about 67 rows in a 30-row terminal; board
+  cards with long label or blocker lines grew taller than the space reserved
+  for them; the tree view was one row too tall. Each view is now sized to fit,
+  every view is clipped to the window as a last resort, and at 100 columns and
+  below the footer drops whole hints (keeping `? help` to the last) instead of
+  being cut mid-word
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/12ae9975)).
+- **`install.sh` works with only `jq`.** The installer said "install python3 or
+  jq", but picking the release archive only worked with Python, so a machine
+  with just `jq` fell back to building from source. Both tools now work and
+  are tested to give the same answer
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/409f0409)).
+- **The macOS Go installer fallback runs and is checked.** When `install.sh`
+  needs Go on macOS and offers the official `.pkg`, it never actually got a
+  download URL, so that path silently did nothing. It now builds the URL from
+  go.dev's file list and refuses to run the package unless its SHA-256 matches
+  the one go.dev publishes
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/409f0409),
+  [URL and checksum](https://github.com/Dicklesworthstone/beads_viewer/commit/a84e7081)).
+
+## v0.25.1 — 2026-09-29
+
+### Fixes since the September 16 entries
+
+- **Shortcuts sidebar no longer breaks other views (GH #209).** With the
+  sidebar open (`;`), only the list view made room for it. Board, graph,
+  insights, actionable, history, tree, label dashboard, attention, flow matrix
+  and the sprint dashboard were drawn at full width with the sidebar added on,
+  so rows wrapped into each other and the footer was pushed off screen. Every
+  view is now laid out in the space left beside the sidebar, overlays such as
+  help and the pickers no longer get the sidebar next to them, and on a
+  terminal too narrow for it the sidebar is hidden and the status line says why
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/d404af74),
+  [row tests](https://github.com/Dicklesworthstone/beads_viewer/commit/1dd7282f),
+  [live-reload speed](https://github.com/Dicklesworthstone/beads_viewer/commit/3924cdda)).
+- **Dashboard time travel works again after merges.** `--export-pages` could
+  skip `history.json` with the warning "timeline commit … missing from source
+  history" once a branch that edited the tracker had been merged, so the
+  exported dashboard had no time travel. The same happened when the tracker
+  had been renamed (for example `beads.jsonl` to `issues.jsonl`) and an older
+  branch that edited the old name was merged later. The timeline now orders
+  its commits by their full Git ancestry
+  ([merged branches](https://github.com/Dicklesworthstone/beads_viewer/commit/bbe40d02),
+  [renamed tracker](https://github.com/Dicklesworthstone/beads_viewer/commit/d81990f4)).
+- **The right tracker is loaded.** When `BEADS_DB`, `BEADS_DIR` or `--db` names
+  a tracker directory, a newer export in an unrelated Git worktree can no
+  longer win. A SQLite tracker whose recent writes are still in its WAL file is
+  treated as fresh instead of losing to an older JSONL export, and when two
+  files are equally fresh `issues.jsonl` is preferred over legacy names. The
+  cached validation result is dropped whenever the source actually changes
+  ([worktrees](https://github.com/Dicklesworthstone/beads_viewer/commit/9d829c05),
+  [WAL freshness](https://github.com/Dicklesworthstone/beads_viewer/commit/b2ca798a),
+  [name ties](https://github.com/Dicklesworthstone/beads_viewer/commit/c4d5afb6),
+  [cache identity](https://github.com/Dicklesworthstone/beads_viewer/commit/76a55e12)).
+- **Stable history and correlation output.** Several beads changed in one
+  commit are reported in the same order on every run, commit references keep
+  the full SHA, a commit seen through several bead histories is counted once,
+  and a deleted bead's history now ends with its deletion
+  ([ordering](https://github.com/Dicklesworthstone/beads_viewer/commit/61bbc9a4),
+  [commit identity](https://github.com/Dicklesworthstone/beads_viewer/commit/04ea45c6),
+  [deletion](https://github.com/Dicklesworthstone/beads_viewer/commit/d49d0e0f)).
+- **Searching for an issue ID finds it.** Typing an exact issue ID now always
+  shows that issue, even with hybrid ranking and more than 75 matches
+  ([search](https://github.com/Dicklesworthstone/beads_viewer/commit/00225577)).
+- **Agent-file reads are bounded.** Inspecting or updating `AGENTS.md` refuses
+  files over 16 MiB, rejects a file that changes size while being read, and no
+  longer follows a symlink to an unrelated file
+  ([agent files](https://github.com/Dicklesworthstone/beads_viewer/commit/6faa297c)).
+- **Source installs report the real compiler.** `install.sh` and `install.ps1`
+  now print the Go version the build actually used (the module's pinned
+  toolchain), not the version of the `go` command that launched it
+  ([installer](https://github.com/Dicklesworthstone/beads_viewer/commit/be0e8beb)).
+- Vendored dashboard libraries, the graph WASM glue and frozen test fixtures
+  are byte-identical to their recorded hashes again; a formatting pass had
+  rewritten them
+  ([assets](https://github.com/Dicklesworthstone/beads_viewer/commit/d4e51d83),
+  [fixtures](https://github.com/Dicklesworthstone/beads_viewer/commit/f9f0283f)).
+- The exported dashboard of this repository now ships its database twice (as
+  one file and as 1 MiB chunks) because the tracker passed the 5 MiB chunking
+  threshold, so the recorded bundle size in `tests/artifacts/perf/pages_load.json`
+  was re-measured (9.8 MB to 17.5 MB). The export code is unchanged; v0.25.0
+  produces the same bundle for the same tracker.
+
+### Dashboard graph and timeline
+
+- The force graph now validates exported node positions and blocking edges
+  against the loaded database, then paints matching positions without synchronous
+  layout warmup. Completed PageRank and exact betweenness results can be reused;
+  missing, invalid, or sampled results fall back to browser computation. Live
+  physics and other browser algorithms remain enabled. Detail-pane resizing,
+  cyclic fallback layouts, and graph-state resets are also repaired
+  ([layout integration](https://github.com/Dicklesworthstone/beads_viewer/commit/2849f125),
+  [rendering and metric reuse](https://github.com/Dicklesworthstone/beads_viewer/commit/04a0107b)).
+- Timeline playback follows recorded Git lifecycle events, distinguishes removal
+  from closure, preserves the observed baseline at the retained history boundary,
+  and supports reverse scrubbing. Nodes fade, grow, pulse, and shrink; reduced
+  motion skips transitions. Sprint buttons use current definitions. Playback
+  resets on graph replacement and avoids repeated synchronous layout warmup
+  ([recorded events](https://github.com/Dicklesworthstone/beads_viewer/commit/ae8bc598),
+  [removal](https://github.com/Dicklesworthstone/beads_viewer/commit/53d97f69),
+  [canvas animation](https://github.com/Dicklesworthstone/beads_viewer/commit/a689e4f6)).
+  History remains bounded to 500 commits and the current export's issue universe.
+- Real Chromium desktop/mobile-viewport journeys verify controls, drawing,
+  fallbacks, detail interaction, and offline updates. A 1,000-node, 21-commit
+  fixture measured playback p99 at 33.3 ms in both viewports. This is not a
+  physical-phone result or the separate CLI/TUI performance qualification.
+  Original workstreams `bv-643f` and `bv-z38b` are complete.
+
+### Tree visibility, terminal integration, and history
+
+- Tree view keeps rootless parent-child cycles visible and preserves repeated
+  cycle/diamond occurrences when replacing analysis snapshots
+  ([display roots](https://github.com/Dicklesworthstone/beads_viewer/commit/6a7252b1),
+  [snapshot copying](https://github.com/Dicklesworthstone/beads_viewer/commit/6334631d)).
+- Clipboard copy can fall back to OSC 52 over SSH when local helpers are absent
+  or fail. tmux receives the raw sequence; GNU screen retains its passthrough
+  wrapping ([clipboard repair](https://github.com/Dicklesworthstone/beads_viewer/commit/bc475f3c)).
+- Windows automatic theme selection can query Windows Terminal's background;
+  `BV_NO_BG_QUERY` disables the query. Parser and cross-build checks pass, but
+  actual Windows Terminal console I/O remains unverified
+  ([background query](https://github.com/Dicklesworthstone/beads_viewer/commit/240b0fa0)).
+- Filtered history requests can reuse fresh full-history event caches when
+  both Git blob identities match. Rebuildable event caches no longer require
+  a durability flush; corruption still triggers reconstruction. Real Git
+  regression tests cover freshness, identity, filtering, and interrupted writes
+  ([cache and documentation checks](https://github.com/Dicklesworthstone/beads_viewer/commit/04a0107b)).
+- Public guidance now describes actual search, history, routing, and forecasting
+  behavior. Copied recipe and robot queries execute against real fixtures,
+  including lifecycle duration units. Overall documentation qualification still
+  depends on the open performance and native-platform work
+  ([guidance corrections](https://github.com/Dicklesworthstone/beads_viewer/commit/c2093e57)).
+- `--robot-docs` no longer tells agents that TOON "saves ~30-50% tokens" and no
+  longer offers `bv robot-triage --toon` as the token-saving example. The
+  measured artifact records TOON at 0.93x JSON for `--robot-graph` and 1.09x to
+  1.15x for the nested payloads, and the guidance now says so and points at
+  `--stats`. When no `tru` encoder is discoverable, `--format toon` also stops
+  declaring `output_format: "toon"` over JSON bytes; the envelope now reports
+  `json`, matching the fallback warning already printed on stderr. The
+  `--robot-schema` entry for `Cores` and `Slack` is corrected from `object` to
+  `array`, which is what `--robot-insights` emits.
+- A full README and root `SKILL.md` audit against the current code corrected the
+  fuzzy-filter field set, the HTML export's search fields and its 2-character /
+  8-result limits, the board age band at exactly 30 days, the untyped dependency
+  as a blocking type, the informational status of `related` and
+  `discovered-from`, the correlation feedback stats fields and the unwritable
+  `ignore` decision, the Cass session modal mock and its relative timestamps,
+  the eight-hour workday used by `--robot-capacity` and `--robot-forecast`
+  summary days, the hybrid-only candidate widening, the impossible `"ms": 0` on a
+  skipped metric, the `--robot-diff` cycle field names, the `--robot-recipes`
+  example descriptions, and `SKILL.md`'s claim that `.status` is top-level on
+  `--robot-triage`. The in-app tutorial no longer advertises fuzzy search as
+  typo-tolerant or the hashed-keyword embedder as meaning-based.
+
+### Duplicate detection and rendering
+
+- Duplicate detection now retains only the requested best candidates for
+  unique issue IDs instead of storing and sorting every matching pair. It
+  preserves score/ID ordering and source-specific keyword explanations;
+  repeated IDs retain the existing full-sort behavior. Earlier changes defer
+  explanations until selection, compact candidate storage, and reuse overlap
+  counts. In the dense 500-issue benchmark requesting 20 suggestions, the
+  final bounded-selection step reduced median allocated bytes from 42.8 MB
+  to 2.18 MB and median time from 232 ms to 31 ms across five runs on the
+  same Linux worker with Go 1.26.8 and
+  GOMAXPROCS=4. Overlap enumeration can still be quadratic
+  ([bounded selection](https://github.com/Dicklesworthstone/beads_viewer/commit/f4c7310f6a64ab8fe964cf3ba877874a020d9abb);
+  [source-pair regression](https://github.com/Dicklesworthstone/beads_viewer/commit/2d57b6ae)).
+- Reusable theme styles precompute ANSI palette conversions while retaining
+  live light/dark and terminal-profile selection. Exact rendering comparisons
+  cover all four profiles; out-of-range numeric colors preserve their original
+  lazy behavior. The focused ANSI256 label benchmark uses nine allocations
+  instead of ten; it does not establish an application-wide latency gain
+  ([palette conversion](https://github.com/Dicklesworthstone/beads_viewer/commit/174b1d3aea10bc6e95b21cba35d1e0b2bc371cdd)).
+- Panel borders now reuse that palette conversion instead of repeating it for
+  each border character. Exact comparisons preserve output across profiles,
+  light/dark settings, and narrow layouts. In five runs rendering two 65×40
+  panels with ANSI256 dark colors, median time fell from 0.780 ms to 0.443 ms
+  and allocations from 1,658 to 1,494 per iteration. This measures panel
+  rendering, not complete UI latency
+  ([panel borders](https://github.com/Dicklesworthstone/beads_viewer/commit/5614d89e55baefcbdfbdb72f4a27b0493bead01a)).
+- A priority-confidence test now uses the calculator's fixed clock when
+  selecting its fixture, preventing calendar-dependent staleness from
+  invalidating the test. Its confidence thresholds and assertions are unchanged
+  ([fixture clock](https://github.com/Dicklesworthstone/beads_viewer/commit/f513f0194383deceb938aa3656c27898c47d3047)).
+
+These changes advance `bv-apal.1`; its full performance qualification remains
+open. All 36 current-only UI cohorts passed the unchanged 50 ms limits on
+hz4, with 36,000 samples and a worst p99 of 34.47 ms. This does not replace
+the original paired UI and CLI matrix.
+
+### Nix usage and verification
+
+- The README now explains that another flake's `nixpkgs` configuration does
+  not configure `bv`'s own import. Consumers of its exported package must keep
+  the documented explicit unfree allowance
+  ([corrected instructions](https://github.com/Dicklesworthstone/beads_viewer/commit/c938d4000fa9fe8c646f9ef8eae4f44205c23053)).
+- Native Linux amd64 Nix build and executable checks were completed against
+  the v0.25.0 source. The subsequent RCH source-verification timeout and the
+  remaining native-platform gaps are recorded separately in
+  [release verification](docs/RELEASING.md); this does not close `bv-oonu.9`.
+
+## v0.25.0 — 2026-09-12
+
+Published from `87cee258` after all ten release-gate stages passed through
+RCH with no skips. Five platform archives, checksums, the sealed gate receipt
+and a packaged-binary SBOM were uploaded with DSR; all 14 assets were downloaded
+and verified before publication. Homebrew and Scoop manifests were updated.
+Native Linux amd64, macOS arm64 and Windows amd64 installer/update checks passed,
+as did the packaged binary's desktop/mobile/offline browser journeys. Native
+source-build acceptance and the incomplete P1 performance matrix remain open.
 
 ### Priority recommendation performance
 

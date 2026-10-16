@@ -8,6 +8,40 @@ import (
 	"testing"
 )
 
+func TestDetectAgentFileBoundsInspection(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "AGENTS.md")
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxAgentFileBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	detection := DetectAgentFile(dir)
+	if !detection.Found() || detection.Content != "" || detection.HasBlurb {
+		t.Fatalf("oversized agent file should be detected without reading content: %+v", detection)
+	}
+}
+
+func TestDetectAgentFileDoesNotFollowSymlink(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(targetPath, []byte(AgentBlurb), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(targetPath, filepath.Join(dir, "AGENTS.md")); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	detection := DetectAgentFile(dir)
+	if !detection.Found() || detection.Content != "" || detection.HasBlurb {
+		t.Fatalf("symlink target content must not be inspected: %+v", detection)
+	}
+}
+
 func TestDetectAgentFile(t *testing.T) {
 	// Create a temporary directory for testing
 	tmpDir := t.TempDir()
@@ -235,15 +269,15 @@ func TestDetectAgentFileReportsMalformedAndDuplicateBlurbs(t *testing.T) {
 
 func TestDetectAgentFileReportsHighestAndFutureBlurbVersion(t *testing.T) {
 	tmpDir := t.TempDir()
-	content := "<!-- bv-agent-instructions-v5 -->\ncurrent\n<!-- end-bv-agent-instructions -->\n" +
-		"<!-- bv-agent-instructions-v7 -->\nfuture\n<!-- end-bv-agent-instructions -->\n"
+	futureVersion := BlurbVersion + 1
+	content := AgentBlurb + "\n" + fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\nfuture\n<!-- end-bv-agent-instructions -->\n", futureVersion)
 	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	detection := DetectAgentFile(tmpDir)
-	if detection.BlurbVersion != 7 {
-		t.Fatalf("BlurbVersion=%d, want highest version 7", detection.BlurbVersion)
+	if detection.BlurbVersion != futureVersion {
+		t.Fatalf("BlurbVersion=%d, want highest version %d", detection.BlurbVersion, futureVersion)
 	}
 	if !detection.HasFutureBlurb() || !detection.NeedsUpgrade() {
 		t.Fatalf("future detection=%+v, want future and needs-attention state", detection)

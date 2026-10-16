@@ -100,7 +100,69 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 		}
 	}
 
-	var pairs []DuplicatePair
+	// With unique IDs, score and canonical IDs totally order the pairs. Retain
+	// only the requested best pairs in a worst-first heap. Repeated IDs can
+	// leave indistinguishable sort keys with different explanations; keep the
+	// existing full-sort path for those inputs.
+	issueMap := make(map[string]*model.Issue, len(issues))
+	repeatedIDs := false
+	for i := range issues {
+		if _, exists := issueMap[issues[i].ID]; exists {
+			repeatedIDs = true
+		}
+		issueMap[issues[i].ID] = &issues[i]
+	}
+	// Explanations are generated only after selection, using source indices.
+	type candidate struct {
+		issue1, issue2 string
+		similarity     float64
+		left, right    int
+	}
+	var pairs []candidate
+	better := func(a, b candidate) bool {
+		return duplicatePairLess(
+			DuplicatePair{Issue1: a.issue1, Issue2: a.issue2, Similarity: a.similarity},
+			DuplicatePair{Issue1: b.issue1, Issue2: b.issue2, Similarity: b.similarity},
+		)
+	}
+	retain := func(c candidate) {
+		if repeatedIDs {
+			pairs = append(pairs, c)
+			return
+		}
+		if len(pairs) < config.MaxSuggestions {
+			pairs = append(pairs, c)
+			for child := len(pairs) - 1; child > 0; {
+				parent := (child - 1) / 2
+				if !better(pairs[parent], pairs[child]) {
+					break
+				}
+				pairs[parent], pairs[child] = pairs[child], pairs[parent]
+				child = parent
+			}
+			return
+		}
+		if !better(c, pairs[0]) {
+			return
+		}
+		pairs[0] = c
+		for parent := 0; ; {
+			child := parent*2 + 1
+			if child >= len(pairs) {
+				break
+			}
+			if right := child + 1; right < len(pairs) && better(pairs[child], pairs[right]) {
+				child = right
+			}
+			if !better(pairs[parent], pairs[child]) {
+				break
+			}
+			pairs[parent], pairs[child] = pairs[child], pairs[parent]
+			parent = child
+		}
+	}
+	// Reuse scratch storage; overlap counts belong only to the current issue.
+	overlaps := make(map[int]int)
 
 	// 2. Iterate through issues and find candidates
 	for i := range issues {
@@ -111,7 +173,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 		// Count overlaps with other issues
 		// candidateIdx -> intersection count
-		overlaps := make(map[int]int)
+		clear(overlaps)
 
 		for _, w := range keywords[i] {
 			for _, matchIdx := range index[w] {
@@ -152,38 +214,33 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 				}
 			}
 
-			// Reconstruct common keywords for display (only for passing pairs)
-			common := intersectKeywords(keywords[i], keywords[j])
-
 			issue1ID, issue2ID := issue1.ID, issue2.ID
 			if issue2ID < issue1ID {
 				issue1ID, issue2ID = issue2ID, issue1ID
 			}
-			pairs = append(pairs, DuplicatePair{
-				Issue1:     issue1ID,
-				Issue2:     issue2ID,
-				Similarity: similarity,
-				Method:     "jaccard",
-				Keywords:   common,
+			retain(candidate{
+				issue1: issue1ID, issue2: issue2ID, similarity: similarity,
+				left: i, right: j,
 			})
 		}
 	}
 
 	// Sort by similarity (highest first) and limit
-	sortPairsBySimilarity(pairs)
+	sort.Slice(pairs, func(i, j int) bool {
+		return better(pairs[i], pairs[j])
+	})
 	if len(pairs) > config.MaxSuggestions {
 		pairs = pairs[:config.MaxSuggestions]
 	}
 
-	// Issue lookup map for constructing suggestions
-	issueMap := make(map[string]*model.Issue, len(issues))
-	for i := range issues {
-		issueMap[issues[i].ID] = &issues[i]
-	}
-
 	// Convert to suggestions
 	suggestions := make([]Suggestion, 0, len(pairs))
-	for _, pair := range pairs {
+	for _, candidate := range pairs {
+		pair := DuplicatePair{
+			Issue1: candidate.issue1, Issue2: candidate.issue2, Similarity: candidate.similarity,
+			Method:   "jaccard",
+			Keywords: intersectKeywords(keywords[candidate.left], keywords[candidate.right]),
+		}
 		issue1 := issueMap[pair.Issue1]
 		issue2 := issueMap[pair.Issue2]
 
@@ -265,14 +322,18 @@ func extractKeywords(title, description string) []string {
 // Uses sort.Slice for O(n log n) performance instead of bubble sort O(n²)
 func sortPairsBySimilarity(pairs []DuplicatePair) {
 	sort.Slice(pairs, func(i, j int) bool {
-		if pairs[i].Similarity != pairs[j].Similarity {
-			return pairs[i].Similarity > pairs[j].Similarity
-		}
-		if pairs[i].Issue1 != pairs[j].Issue1 {
-			return pairs[i].Issue1 < pairs[j].Issue1
-		}
-		return pairs[i].Issue2 < pairs[j].Issue2
+		return duplicatePairLess(pairs[i], pairs[j])
 	})
+}
+
+func duplicatePairLess(a, b DuplicatePair) bool {
+	if a.Similarity != b.Similarity {
+		return a.Similarity > b.Similarity
+	}
+	if a.Issue1 != b.Issue1 {
+		return a.Issue1 < b.Issue1
+	}
+	return a.Issue2 < b.Issue2
 }
 
 // truncateStringSlice truncates a string slice to max length

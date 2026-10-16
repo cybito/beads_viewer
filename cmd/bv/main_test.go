@@ -45,6 +45,310 @@ func runCommandWithTimeout(t *testing.T, dir, exe string, args ...string) (strin
 	return stdout.String(), stderr.String(), err
 }
 
+// A merged side branch that touched the tracker makes the first N commits in
+// topological order a different set from the first N in date order, which is
+// the window the extractor reads. Every retained commit must still be ranked;
+// before the fix the export failed with "timeline commit ... missing from
+// source history" and shipped no history.json.
+func TestHistoryExportRanksRetainedCommitsAfterMergedSideBranch(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	previousLimit := timeTravelCommitLimit
+	timeTravelCommitLimit = 3
+	t.Cleanup(func() { timeTravelCommitLimit = previousLimit })
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	line := func(id string) string {
+		return fmt.Sprintf("{\"id\":%q,\"title\":\"Issue %s\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", id, id, start.Format(time.RFC3339), start.Format(time.RFC3339))
+	}
+	record := func(hour int, message string, ids ...string) string {
+		t.Helper()
+		var data strings.Builder
+		for _, id := range ids {
+			data.WriteString(line(id))
+		}
+		if err := os.WriteFile(".beads/issues.jsonl", []byte(data.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(hour, "add", ".beads/issues.jsonl")
+		git(hour, "commit", "-m", message)
+		return git(hour, "rev-parse", "HEAD")
+	}
+
+	git(0, "init", "-b", "main")
+	if err := os.Mkdir(".beads", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record(0, "base", "bv-base")
+	// The side branch is older than the main-line work, so date order puts it
+	// after main, while topological order lists it first.
+	git(0, "checkout", "-b", "side")
+	record(1, "side 1", "bv-base", "bv-s1")
+	record(2, "side 2", "bv-base", "bv-s1", "bv-s2")
+	record(3, "side 3", "bv-base", "bv-s1", "bv-s2", "bv-s3")
+	git(3, "checkout", "main")
+	m1 := record(10, "main 1", "bv-base", "bv-m1")
+	m2 := record(11, "main 2", "bv-base", "bv-m1", "bv-m2")
+	git(20, "merge", "--no-ff", "--no-commit", "-X", "ours", "side")
+	record(20, "merge side", "bv-base", "bv-m1", "bv-m2", "bv-s1", "bv-s2", "bv-s3")
+
+	// Precondition: a bounded topological walk really does omit main-line
+	// commits that the date-ordered window keeps.
+	bounded := git(20, "log", "--format=%H", "--topo-order", "--follow", "-n", strconv.Itoa(timeTravelCommitLimit), "HEAD", "--", ".beads/issues.jsonl")
+	if strings.Contains(bounded, m1) || strings.Contains(bounded, m2) {
+		t.Fatalf("fixture no longer separates the two walks; bounded topological walk:\n%s", bounded)
+	}
+
+	issues := []model.Issue{{ID: "bv-base"}, {ID: "bv-m1"}, {ID: "bv-m2"}, {ID: "bv-s1"}, {ID: "bv-s2"}, {ID: "bv-s3"}}
+	history, err := generateHistoryForExport(issues)
+	if err != nil {
+		t.Fatalf("history export failed after merging a side branch: %v", err)
+	}
+	position := map[string]int{}
+	for i, commit := range history.Commits {
+		position[commit.SHA] = i
+	}
+	for sha, id := range map[string]string{m1: "bv-m1", m2: "bv-m2"} {
+		i, ok := position[sha]
+		if !ok {
+			t.Fatalf("retained commit %s (%s) missing from timeline: %#v", sha, id, history.Commits)
+		}
+		if got := history.Commits[i].BeadsAdded; !reflect.DeepEqual(got, []string{id}) {
+			t.Fatalf("commit %s added %v, want [%s]", sha, got, id)
+		}
+	}
+	if position[m1] >= position[m2] {
+		t.Fatalf("timeline replays main 2 before its parent main 1: %#v", history.Commits)
+	}
+}
+
+// The tracker is renamed on main while an older side branch still edits the
+// old name, and that branch is merged afterwards. The extractor's date-ordered
+// --follow walk reaches the rename first and keeps the side commit; a
+// --follow walk in topological order lists the side branch while still on the
+// new name and drops it, so ranking by a path walk failed with "timeline
+// commit ... missing from source history".
+func TestHistoryExportRanksRenamedTrackerSideBranch(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(name string, ids ...string) {
+		t.Helper()
+		var data strings.Builder
+		for _, id := range ids {
+			fmt.Fprintf(&data, "{\"id\":%q,\"title\":\"Issue %s\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", id, id, start.Format(time.RFC3339), start.Format(time.RFC3339))
+		}
+		if err := os.WriteFile(name, []byte(data.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(0, "init", "-b", "main")
+	if err := os.Mkdir(".beads", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(".beads/beads.jsonl", "bv-a")
+	git(0, "add", "-A")
+	git(0, "commit", "-m", "base")
+	write(".beads/beads.jsonl", "bv-a", "bv-b")
+	git(1, "commit", "-am", "main old name")
+	mainOld := git(1, "rev-parse", "HEAD")
+	git(1, "checkout", "-b", "side")
+	write(".beads/beads.jsonl", "bv-a", "bv-b", "bv-s")
+	git(2, "commit", "-am", "side old name")
+	side := git(2, "rev-parse", "HEAD")
+	git(2, "checkout", "main")
+	git(3, "mv", ".beads/beads.jsonl", ".beads/issues.jsonl")
+	git(3, "commit", "-m", "rename tracker")
+	write(".beads/issues.jsonl", "bv-a", "bv-b", "bv-c")
+	git(4, "commit", "-am", "main new name")
+	mainNew := git(4, "rev-parse", "HEAD")
+	git(7, "merge", "--no-commit", "-X", "ours", "side")
+	write(".beads/issues.jsonl", "bv-a", "bv-b", "bv-s", "bv-c")
+	git(7, "add", "-A")
+	git(7, "commit", "-m", "merge side")
+
+	issues := []model.Issue{{ID: "bv-a"}, {ID: "bv-b"}, {ID: "bv-c"}, {ID: "bv-s"}}
+	history, err := generateHistoryForExport(issues)
+	if err != nil {
+		t.Fatalf("history export failed after merging a side branch that edited the old tracker name: %v", err)
+	}
+	position := map[string]int{}
+	for i, commit := range history.Commits {
+		position[commit.SHA] = i
+	}
+	for sha, id := range map[string]string{mainOld: "bv-b", side: "bv-s", mainNew: "bv-c"} {
+		i, ok := position[sha]
+		if !ok {
+			t.Fatalf("commit %s (adds %s) missing from timeline: %#v", sha, id, history.Commits)
+		}
+		if got := history.Commits[i].BeadsAdded; !reflect.DeepEqual(got, []string{id}) {
+			t.Fatalf("commit %s added %v, want [%s]", sha, got, id)
+		}
+	}
+	if position[mainOld] >= position[side] || position[mainOld] >= position[mainNew] {
+		t.Fatalf("timeline replays a commit before its parent: %#v", history.Commits)
+	}
+}
+
+func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		// The retained_window subtest makes 500 commits. With automatic
+		// maintenance on, git 2.54 runs it mid-sequence and a later commit
+		// fails with "fatal: unable to read <object>"; the fixture never needs it.
+		cmd := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
+		cmd.Dir = repo
+		// Distinct commits can share Git's one-second timestamp resolution.
+		at := start.Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git(0, "init", "-b", "main")
+	if err := os.Mkdir(".beads", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var want []TimeTravelCommit
+	for hour, status := range []string{"open", "closed", "closed", "open", "absent", "open"} {
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		data := fmt.Sprintf("{\"id\":\"bv-a\",\"title\":\"Target revision %d\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", hour, status, start.Format(time.RFC3339), at)
+		if status == "absent" {
+			data = ""
+		}
+		data += fmt.Sprintf("{\"id\":\"bv-z\",\"title\":\"Already closed\",\"status\":\"closed\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", start.Format(time.RFC3339), start.Format(time.RFC3339))
+		if err := os.WriteFile(".beads/beads.jsonl", []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(hour, "add", ".beads/beads.jsonl")
+		message := fmt.Sprintf("record lifecycle %d", hour)
+		git(hour, "commit", "-m", message)
+		commit := TimeTravelCommit{SHA: git(hour, "rev-parse", "HEAD"), Date: start.Format(time.RFC3339), Message: message}
+		switch hour {
+		case 0:
+			commit.BeadsAdded = []string{"bv-a", "bv-z"}
+			commit.BeadsClosed = []string{"bv-z"}
+		case 1:
+			commit.BeadsClosed = []string{"bv-a"}
+		case 3, 5:
+			commit.BeadsAdded = []string{"bv-a"}
+		case 4:
+			commit.BeadsRemoved = []string{"bv-a"}
+		}
+		want = append(want, commit)
+	}
+	if err := os.Rename(".beads/beads.jsonl", ".beads/issues.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	git(4, "add", ".beads")
+	git(4, "commit", "-m", "rename issue source")
+	// A correlated code-only commit is not an observed lifecycle transition.
+	if err := os.WriteFile("feature.go", []byte("package fixture\nconst Ready = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(4, "add", "feature.go")
+	git(4, "commit", "-m", "bv-a: follow-up code work")
+	issues := []model.Issue{{ID: "bv-a", Title: "Target revision 3", Status: model.StatusOpen}, {ID: "bv-z", Title: "Already closed", Status: model.StatusClosed}}
+	if err := os.WriteFile(".beads/sprints.jsonl", []byte("{\"id\":\"sprint-1\",\"name\":\"Recorded sprint\",\"start_date\":\"2026-01-01T00:00:00Z\",\"end_date\":\"2026-01-08T00:00:00Z\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for run := 0; run < 2; run++ {
+		history, err := generateHistoryForExport(issues)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(history.Commits, want) {
+			t.Fatalf("run %d: lifecycle timeline mismatch\n got: %#v\nwant: %#v", run, history.Commits, want)
+		}
+		if len(history.InitialBeads) != 0 {
+			t.Fatalf("creation inside the retained window must not seed earlier visibility: %v", history.InitialBeads)
+		}
+		if len(history.Sprints) != 1 || history.Sprints[0].ID != "sprint-1" || !history.Sprints[0].StartDate.Equal(start) {
+			t.Fatalf("timeline sprint definitions: %#v", history.Sprints)
+		}
+	}
+	t.Run("retained_window", func(t *testing.T) {
+		// Push creation outside the real 500-source-commit window. The target
+		// is open at its boundary but closed now; current status is no baseline.
+		for i := 0; i <= 500; i++ {
+			status := "open"
+			if i == 500 {
+				status = "closed"
+			}
+			data := fmt.Sprintf("{\"id\":\"bv-a\",\"title\":\"Target %d\",\"status\":%q}\n{\"id\":\"bv-z\",\"title\":\"Closed %d\",\"status\":\"closed\"}\n", i, status, i)
+			if i >= 499 {
+				data += "{\"id\":\"bv-new\",\"title\":\"Created inside window\",\"status\":\"open\"}\n"
+			}
+			if err := os.WriteFile(".beads/issues.jsonl", []byte(data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			git(i, "add", ".beads/issues.jsonl")
+			git(i, "commit", "-m", fmt.Sprintf("retained record %d", i))
+		}
+		history, err := generateHistoryForExport([]model.Issue{
+			{ID: "bv-a", Status: model.StatusClosed}, {ID: "bv-z", Status: model.StatusClosed},
+			{ID: "bv-new", Status: model.StatusOpen}, {ID: "bv-unknown", Status: model.StatusOpen},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(history)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exported struct {
+			InitialBeads []string `json:"initial_beads"`
+		}
+		if err := json.Unmarshal(data, &exported); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(exported.InitialBeads, []string{"bv-a"}) {
+			t.Fatalf("observed unresolved baseline: got %v, want only bv-a (not closed, newly created, or unknown records)", exported.InitialBeads)
+		}
+		if len(history.Commits) != 500 || history.Commits[0].Message != "retained record 1" || !reflect.DeepEqual(history.Commits[499].BeadsClosed, []string{"bv-a"}) {
+			t.Fatalf("retained window or final closure incorrect: %#v", history)
+		}
+	})
+}
+
 func TestFilterByRepo_CaseInsensitiveAndFlexibleSeparators(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "api-AUTH-1", SourceRepo: "services/api"},
