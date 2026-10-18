@@ -31,6 +31,7 @@ type imeReporter struct {
 	declared   bool
 	active     bool // applied locally, or recorded by Herdr; never inferred
 	suspended  bool // terminal is currently handed to a child
+	focusLost  bool // explicit BlurMsg; input and child return cannot override it
 	closed     bool
 	failure    error
 }
@@ -239,6 +240,9 @@ func (r *imeReporter) drop() {
 func (r *imeReporter) startEpisode(state string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Real focus may arrive during a child handoff. Remember it without
+	// acquiring ownership until that handoff has finished.
+	r.focusLost = false
 	return r.startEpisodeLocked(state, false)
 }
 
@@ -252,7 +256,7 @@ func (r *imeReporter) startEpisodeLocked(state string, realKey bool) error {
 	if r.failure != nil {
 		return r.failure
 	}
-	if r.closed || r.suspended {
+	if r.closed || r.suspended || r.focusLost {
 		return nil
 	}
 	if realKey && r.openParams != nil && r.active {
@@ -307,10 +311,11 @@ func (r *imeReporter) reportLocked(state string) error {
 func (r *imeReporter) blur() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.focusLost = true
+	r.active = false
 	if r.closed || r.suspended || !r.declared {
 		return nil
 	}
-	r.active = false
 	_, err := r.exchange(imeRequest{Op: "blur"})
 	return err
 }

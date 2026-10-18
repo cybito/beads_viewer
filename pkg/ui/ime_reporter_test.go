@@ -400,6 +400,135 @@ func noIMEEvent(t *testing.T, events <-chan imeTestEvent) {
 	}
 }
 
+func TestTUIIMEExplicitBlurBlocksInputUntilFocus(t *testing.T) {
+	for _, herdr := range []bool{false, true} {
+		t.Run(fmt.Sprintf("herdr=%v", herdr), func(t *testing.T) {
+			path, events := imeTestServer(t, herdr, "", nil)
+			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
+			defer m.Stop()
+			r := newIMEReporter(path)
+			if herdr {
+				r.openParams = map[string]string{"pane_id": "fixture"}
+			}
+			m.imeReporter = r
+			m.startIMEEpisode()
+			if herdr {
+				expectIMEEvent(t, events, "", "")
+			}
+			expectIMEEvent(t, events, "activate", "command")
+			m.Update(tea.BlurMsg{})
+			expectIMEEvent(t, events, "blur", "")
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("中"), Paste: true})
+			m.Update(tea.MouseMsg{})
+			m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+			noIMEEvent(t, events)
+			if m.imeFocused || r.isActive() || m.focused == focusBoard {
+				t.Fatal("input overrode explicit blur")
+			}
+			m.Update(tea.FocusMsg{})
+			expectIMEEvent(t, events, "activate", "command")
+			if !m.imeFocused {
+				t.Fatal("real focus failed to reacquire")
+			}
+			m.CloseIME()
+			expectIMEEvent(t, events, "close", "")
+		})
+	}
+}
+
+func TestIMEBlurSurvivesSuspensionUntilRealFocus(t *testing.T) {
+	for _, herdr := range []bool{false, true} {
+		for _, focusDuringSuspension := range []bool{false, true} {
+			t.Run(fmt.Sprintf("herdr=%v/focusDuringSuspension=%v", herdr, focusDuringSuspension), func(t *testing.T) {
+				path, events := imeTestServer(t, herdr, "", nil)
+				r := newIMEReporter(path)
+				if herdr {
+					r.openParams = map[string]string{"pane_id": "fixture"}
+				}
+				check := func(err error) {
+					t.Helper()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				check(r.startEpisode("command"))
+				if herdr {
+					expectIMEEvent(t, events, "", "")
+				}
+				expectIMEEvent(t, events, "activate", "command")
+				check(r.suspend())
+				expectIMEEvent(t, events, "suspend", "")
+				check(r.blur())
+				check(r.key("command"))
+				if focusDuringSuspension {
+					check(r.startEpisode("text"))
+				}
+				noIMEEvent(t, events)
+				check(r.finishSuspension("text"))
+				if !focusDuringSuspension {
+					check(r.key("command"))
+					check(r.report("command"))
+					noIMEEvent(t, events)
+					if r.isActive() {
+						t.Fatal("child return overrode explicit blur")
+					}
+					check(r.startEpisode("text"))
+				}
+				expectIMEEvent(t, events, "activate", "text")
+				check(r.close())
+				expectIMEEvent(t, events, "close", "")
+			})
+		}
+	}
+}
+
+func TestIMEBlurBeforeDeclarationBlocksInput(t *testing.T) {
+	path, events := imeTestServer(t, false, "", nil)
+	r := newIMEReporter(path)
+	if err := r.blur(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.key("command"); err != nil {
+		t.Fatal(err)
+	}
+	noIMEEvent(t, events)
+	if r.conn != nil || r.isActive() {
+		t.Fatal("key after undeclared blur opened a lease")
+	}
+	if err := r.startEpisode("command"); err != nil {
+		t.Fatal(err)
+	}
+	expectIMEEvent(t, events, "activate", "command")
+	if err := r.close(); err != nil {
+		t.Fatal(err)
+	}
+	expectIMEEvent(t, events, "close", "")
+}
+
+func TestIMEExplicitBlurAfterInactiveACKBlocksInput(t *testing.T) {
+	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+		return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"inactive"}`, generation, session)
+	})
+	r := newIMEReporter(path)
+	if err := r.startEpisode("command"); err != nil {
+		t.Fatal(err)
+	}
+	expectIMEEvent(t, events, "activate", "command")
+	if err := r.blur(); err != nil {
+		t.Fatal(err)
+	}
+	expectIMEEvent(t, events, "blur", "")
+	if err := r.key("command"); err != nil {
+		t.Fatal(err)
+	}
+	noIMEEvent(t, events)
+	if err := r.close(); err != nil {
+		t.Fatal(err)
+	}
+	expectIMEEvent(t, events, "close", "")
+}
+
 func TestTUIIMEInactiveWaitsForRealKeyAndCurrentClassifier(t *testing.T) {
 	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
 		if request.Op == "state" {
