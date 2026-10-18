@@ -655,7 +655,48 @@ func TestHerdrIMERejectsIncompleteOpenAndLocalScopes(t *testing.T) {
 	}
 }
 
-func TestHerdrIMEParentChildSuspendKeepsStreamAndWaitsForRealInput(t *testing.T) {
+func TestTUIIMEHandoffReturnDeclaresCurrentModeBeforeInput(t *testing.T) {
+	for _, editor := range []bool{false, true} {
+		for _, editing := range []bool{false, true} {
+			t.Run(fmt.Sprintf("editor=%v/text=%v", editor, editing), func(t *testing.T) {
+				path, events := imeTestServer(t, false, "", nil)
+				m := NewModel(nil, nil, "")
+				defer m.Stop()
+				m.imeReporter = newIMEReporter(path)
+				m.startIMEEpisode()
+				expectIMEEvent(t, events, "activate", "command")
+				if err := m.imeReporter.suspend(); err != nil {
+					t.Fatal(err)
+				}
+				expectIMEEvent(t, events, "suspend", "")
+				m.list.SetFilteringEnabled(true)
+				if editing {
+					m.list.SetFilterState(list.Filtering)
+				}
+				var completion tea.Msg = tea.ResumeMsg{}
+				if editor {
+					completion = editorExitMsg{tmpFile: filepath.Join(t.TempDir(), "editor.md"), err: errors.New("editor cancelled")}
+				}
+				m.Update(completion)
+				state := "command"
+				if editing {
+					state = "text"
+				}
+				expectIMEEvent(t, events, "activate", state)
+				if !m.imeFocused {
+					t.Fatal("terminal return did not obtain current acknowledgement before input")
+				}
+				m.Update(completion)
+				m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+				noIMEEvent(t, events)
+				m.CloseIME()
+				expectIMEEvent(t, events, "close", "")
+			})
+		}
+	}
+}
+
+func TestHerdrIMEParentChildReturnKeepsStreamAndClaimsBeforeInput(t *testing.T) {
 	path, events := imeTestServer(t, true, "", nil)
 	setHerdrIMEEnv(t, path)
 	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
@@ -695,13 +736,13 @@ func TestHerdrIMEParentChildSuspendKeepsStreamAndWaitsForRealInput(t *testing.T)
 	}
 	expectIMEEvent(t, events, "close", "")
 	m.Update(tea.ResumeMsg{})
-	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
-	noIMEEvent(t, events)
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
-	event = expectIMEEvent(t, events, "resume", "command")
+	event = expectIMEEvent(t, events, "activate", "command")
 	if event.session != parent.session {
 		t.Fatal("parent resume recreated its stream instead of resuming the suspended owner")
 	}
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	noIMEEvent(t, events)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
 	expectIMEEvent(t, events, "state", "text")
 	if m.list.FilterState() != list.Filtering {
 		t.Fatal("first post-resume key did not dispatch once")
@@ -711,7 +752,14 @@ func TestHerdrIMEParentChildSuspendKeepsStreamAndWaitsForRealInput(t *testing.T)
 }
 
 func TestTUIIMEEditorCompletionCannotAcquireInBackground(t *testing.T) {
-	path, events := imeTestServer(t, false, "", nil)
+	var foreground atomic.Bool
+	foreground.Store(true)
+	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+		if request.Op == "activate" && !foreground.Load() {
+			return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"inactive"}`, generation, session)
+		}
+		return ""
+	})
 	m := NewModel(nil, nil, "")
 	defer m.Stop()
 	m.imeReporter = newIMEReporter(path)
@@ -726,14 +774,17 @@ func TestTUIIMEEditorCompletionCannotAcquireInBackground(t *testing.T) {
 		t.Fatal(err)
 	}
 	file.Close()
+	foreground.Store(false)
 	m.Update(editorExitMsg{tmpFile: file.Name(), err: errors.New("editor cancelled")})
+	expectIMEEvent(t, events, "activate", "command")
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	noIMEEvent(t, events)
 	if m.imeFocused || m.imeDisabled {
 		t.Fatal("editor completion claimed background command ownership")
 	}
+	foreground.Store(true)
 	m.Update(tea.FocusMsg{})
-	expectIMEEvent(t, events, "resume", "command")
+	expectIMEEvent(t, events, "activate", "command")
 	m.CloseIME()
 	expectIMEEvent(t, events, "close", "")
 }

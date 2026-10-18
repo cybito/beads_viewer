@@ -20,20 +20,19 @@ import (
 // intent; ordinary local terminals use the daemon that owns the input source.
 // A failed connection is never reopened with a cached mode.
 type imeReporter struct {
-	mu             sync.Mutex
-	path           string
-	openParams     map[string]string // nil for the ordinary local daemon
-	conn           net.Conn
-	reader         *bufio.Reader
-	session        string
-	generation     uint64
-	state          string
-	declared       bool
-	active         bool // applied locally, or recorded by Herdr; never inferred
-	suspended      bool // terminal is currently handed to a child
-	resumeRequired bool
-	closed         bool
-	failure        error
+	mu         sync.Mutex
+	path       string
+	openParams map[string]string // nil for the ordinary local daemon
+	conn       net.Conn
+	reader     *bufio.Reader
+	session    string
+	generation uint64
+	state      string
+	declared   bool
+	active     bool // applied locally, or recorded by Herdr; never inferred
+	suspended  bool // terminal is currently handed to a child
+	closed     bool
+	failure    error
 }
 
 type imeRequest struct {
@@ -233,7 +232,6 @@ func (r *imeReporter) drop() {
 	r.active = false
 	r.declared = false
 	r.state = ""
-	r.resumeRequired = false
 }
 
 // startEpisode explicitly reasserts the current classifier on startup/focus,
@@ -271,7 +269,7 @@ func (r *imeReporter) startEpisodeLocked(state string, realKey bool) error {
 		return r.reportLocked(state)
 	}
 	request := imeRequest{Op: "activate", State: state, Policy: "mode"}
-	if (r.resumeRequired && r.declared) || (realKey && r.openParams == nil && r.active) {
+	if realKey && r.openParams == nil && r.active {
 		request = imeRequest{Op: "resume", State: state}
 	}
 	scope, err := r.exchange(request)
@@ -281,7 +279,6 @@ func (r *imeReporter) startEpisodeLocked(state string, realKey bool) error {
 	r.declared = true
 	r.state = state
 	r.active = scope == "applied" || scope == "recorded"
-	r.resumeRequired = false
 	return nil
 }
 
@@ -331,16 +328,22 @@ func (r *imeReporter) suspend() error {
 		}
 	}
 	r.suspended = true
-	r.resumeRequired = true
 	return nil
 }
 
-// Child completion restores eligibility, not ownership. The next real key or
-// focus episode explicitly resumes the parent with its then-current classifier.
-func (r *imeReporter) finishSuspension() {
+// Terminal return declares this app's current mode, never a child's or parent's.
+// A fresh claim handles delayed child cleanup and is subject to focus arbitration.
+func (r *imeReporter) finishSuspension(state string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.failure != nil {
+		return r.failure
+	}
+	if r.closed || !r.suspended {
+		return nil
+	}
 	r.suspended = false
+	return r.startEpisodeLocked(state, false)
 }
 
 func (r *imeReporter) isActive() bool {

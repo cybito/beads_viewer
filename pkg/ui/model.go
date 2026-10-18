@@ -2211,6 +2211,7 @@ func (m *Model) updateEmbeddedTextInput(msg embeddedTextInputMsg) tea.Cmd {
 func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
+	var terminalReturned bool
 	defer func() {
 		if m.cassRequest != nil {
 			if !m.cassLookupIsCurrent(m.cassRequest) {
@@ -2218,6 +2219,11 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 			} else if m.statusMsg == "" {
 				m.statusMsg = m.cassRequest.status
 			}
+		}
+		if terminalReturned && m.imeReporter != nil {
+			err := m.imeReporter.finishSuspension(m.imeState())
+			m.imeFocused = m.imeReporter.isActive()
+			m.noteIMEError(err)
 		}
 		// A named return reports classifier changes on every UI route.
 		if m.imeFocused && m.imeReporter != nil {
@@ -2261,10 +2267,7 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 		return m, nil
 
 	case tea.ResumeMsg:
-		if m.imeReporter != nil {
-			m.imeReporter.finishSuspension()
-			m.imeFocused = false
-		}
+		terminalReturned = true
 		return m, nil
 
 	case embeddedTextInputMsg:
@@ -2408,10 +2411,7 @@ func (m *Model) Update(msg tea.Msg) (next tea.Model, command tea.Cmd) {
 		return m, tea.Batch(cmd, m.pendingSemanticFilterCmd())
 
 	case editorExitMsg:
-		if m.imeReporter != nil {
-			m.imeReporter.finishSuspension()
-			m.imeFocused = false
-		}
+		terminalReturned = true
 		// Terminal editor exited — parse changes and apply via br update (bv-134)
 		defer os.Remove(msg.tmpFile)
 		if msg.err != nil {
