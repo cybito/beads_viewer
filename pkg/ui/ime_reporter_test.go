@@ -273,8 +273,11 @@ type imeTestEvent struct {
 }
 
 // Exercise actual socket framing and persistent per-connection identities.
-// Replies deliberately model local inactive/application vs Herdr recording.
-func imeTestServer(t *testing.T, herdr bool, openReply string, reply func(imeRequest, string, uint64) string) (string, <-chan imeTestEvent) {
+// Direct replies model local inactive/application. In hc mode the fixture is a
+// herdr-core JSON-RPC server: each terminal.label write becomes a "label"
+// event whose State is the written imekit.intent value, and reply receives the
+// JSON-RPC id as its generation argument.
+func imeTestServer(t *testing.T, hc bool, reply func(imeRequest, string, uint64) string) (string, <-chan imeTestEvent) {
 	t.Helper()
 	path, listener := imeTestListener(t)
 	events := make(chan imeTestEvent, 64)
@@ -307,34 +310,49 @@ func imeTestServer(t *testing.T, herdr bool, openReply string, reply func(imeReq
 				conn.SetDeadline(time.Now().Add(5 * time.Second))
 				reader := bufio.NewReader(conn)
 				generation := uint64(1)
-				if herdr {
-					frame, err := reader.ReadBytes('\n')
-					if err != nil {
-						return
-					}
-					var open struct {
-						ID     string            `json:"id"`
-						Method string            `json:"method"`
-						Params map[string]string `json:"params"`
-					}
-					if err := json.Unmarshal(frame, &open); err != nil || open.ID != "ime:open" || open.Method != "pane.input_intent.stream" {
-						t.Errorf("invalid stream open: %s (%v)", frame, err)
-						return
-					}
-					events <- imeTestEvent{session: session, params: open.Params}
-					response := openReply
-					if response == "" {
-						response = fmt.Sprintf(`{"id":"ime:open","result":{"type":"pane_input_intent_stream_opened","session":%q,"generation":1}}`, session)
-					}
-					if _, err := fmt.Fprintln(conn, response); err != nil {
-						return
-					}
-					generation++
-				}
+				lastID := uint64(0)
 				for {
 					frame, err := reader.ReadBytes('\n')
 					if err != nil {
 						return
+					}
+					if hc {
+						var call struct {
+							JSONRPC string `json:"jsonrpc"`
+							ID      uint64 `json:"id"`
+							Method  string `json:"method"`
+							Params  struct {
+								Terminal string            `json:"terminal"`
+								Labels   map[string]string `json:"labels"`
+							} `json:"params"`
+						}
+						value, ok := "", false
+						if err := json.Unmarshal(frame, &call); err == nil {
+							value, ok = call.Params.Labels["imekit.intent"]
+						}
+						if err != nil || !ok || len(call.Params.Labels) != 1 || call.JSONRPC != "2.0" ||
+							call.Method != "terminal.label" || call.ID <= lastID {
+							t.Errorf("invalid terminal.label call: %s (%v)", frame, err)
+							return
+						}
+						lastID = call.ID
+						request := imeRequest{Op: "label", State: value}
+						events <- imeTestEvent{session: session, request: request, params: map[string]string{"terminal": call.Params.Terminal}}
+						response := ""
+						if reply != nil {
+							response = reply(request, session, call.ID)
+						}
+						if response == "" {
+							labels := "{}"
+							if value != "" {
+								labels = fmt.Sprintf(`{"imekit.intent":%q}`, value)
+							}
+							response = fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"terminal":%q,"labels":%s}}`, call.ID, call.Params.Terminal, labels)
+						}
+						if _, err := fmt.Fprintln(conn, response); err != nil {
+							return
+						}
+						continue
 					}
 					var request imeRequest
 					if err := json.Unmarshal(frame, &request); err != nil {
@@ -347,11 +365,7 @@ func imeTestServer(t *testing.T, herdr bool, openReply string, reply func(imeReq
 						response = reply(request, session, generation)
 					}
 					if response == "" {
-						scope := "applied"
-						if herdr {
-							scope = "recorded"
-						}
-						response = fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":%q}`, generation, session, scope)
+						response = fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"applied"}`, generation, session)
 					}
 					if _, err := fmt.Fprintln(conn, response); err != nil {
 						return
@@ -375,6 +389,42 @@ func imeTestServer(t *testing.T, herdr bool, openReply string, reply func(imeReq
 		workers.Wait()
 	})
 	return path, events
+}
+
+func hcTestLabel(t *testing.T, state string) string {
+	t.Helper()
+	if state == "" {
+		return ""
+	}
+	pgid, err := imeProcessGroup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("1:%d:%s", pgid, state)
+}
+
+func newHCTestReporter(t *testing.T, path string) *imeReporter {
+	t.Helper()
+	pgid, err := imeProcessGroup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newHCIMEReporter(path, "t7", pgid)
+}
+
+// expectIMELifecycle maps a lifecycle request onto what the hc transport writes.
+func expectIMELifecycle(t *testing.T, events <-chan imeTestEvent, hc bool, op, state string) imeTestEvent {
+	t.Helper()
+	if !hc {
+		return expectIMEEvent(t, events, op, state)
+	}
+	switch op {
+	case "blur", "suspend":
+		state = "idle"
+	case "close":
+		state = ""
+	}
+	return expectIMEEvent(t, events, "label", hcTestLabel(t, state))
 }
 
 func expectIMEEvent(t *testing.T, events <-chan imeTestEvent, op, state string) imeTestEvent {
@@ -401,23 +451,20 @@ func noIMEEvent(t *testing.T, events <-chan imeTestEvent) {
 }
 
 func TestTUIIMEExplicitBlurBlocksInputUntilFocus(t *testing.T) {
-	for _, herdr := range []bool{false, true} {
-		t.Run(fmt.Sprintf("herdr=%v", herdr), func(t *testing.T) {
-			path, events := imeTestServer(t, herdr, "", nil)
+	for _, hc := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hc=%v", hc), func(t *testing.T) {
+			path, events := imeTestServer(t, hc, nil)
 			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
 			defer m.Stop()
 			r := newIMEReporter(path)
-			if herdr {
-				r.openParams = map[string]string{"pane_id": "fixture"}
+			if hc {
+				r = newHCTestReporter(t, path)
 			}
 			m.imeReporter = r
 			m.startIMEEpisode()
-			if herdr {
-				expectIMEEvent(t, events, "", "")
-			}
-			expectIMEEvent(t, events, "activate", "command")
+			expectIMELifecycle(t, events, hc, "activate", "command")
 			m.Update(tea.BlurMsg{})
-			expectIMEEvent(t, events, "blur", "")
+			expectIMELifecycle(t, events, hc, "blur", "")
 			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
 			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("中"), Paste: true})
 			m.Update(tea.MouseMsg{})
@@ -427,24 +474,24 @@ func TestTUIIMEExplicitBlurBlocksInputUntilFocus(t *testing.T) {
 				t.Fatal("input overrode explicit blur")
 			}
 			m.Update(tea.FocusMsg{})
-			expectIMEEvent(t, events, "activate", "command")
+			expectIMELifecycle(t, events, hc, "activate", "command")
 			if !m.imeFocused {
 				t.Fatal("real focus failed to reacquire")
 			}
 			m.CloseIME()
-			expectIMEEvent(t, events, "close", "")
+			expectIMELifecycle(t, events, hc, "close", "")
 		})
 	}
 }
 
 func TestIMEBlurSurvivesSuspensionUntilRealFocus(t *testing.T) {
-	for _, herdr := range []bool{false, true} {
+	for _, hc := range []bool{false, true} {
 		for _, focusDuringSuspension := range []bool{false, true} {
-			t.Run(fmt.Sprintf("herdr=%v/focusDuringSuspension=%v", herdr, focusDuringSuspension), func(t *testing.T) {
-				path, events := imeTestServer(t, herdr, "", nil)
+			t.Run(fmt.Sprintf("hc=%v/focusDuringSuspension=%v", hc, focusDuringSuspension), func(t *testing.T) {
+				path, events := imeTestServer(t, hc, nil)
 				r := newIMEReporter(path)
-				if herdr {
-					r.openParams = map[string]string{"pane_id": "fixture"}
+				if hc {
+					r = newHCTestReporter(t, path)
 				}
 				check := func(err error) {
 					t.Helper()
@@ -453,12 +500,9 @@ func TestIMEBlurSurvivesSuspensionUntilRealFocus(t *testing.T) {
 					}
 				}
 				check(r.startEpisode("command"))
-				if herdr {
-					expectIMEEvent(t, events, "", "")
-				}
-				expectIMEEvent(t, events, "activate", "command")
+				expectIMELifecycle(t, events, hc, "activate", "command")
 				check(r.suspend())
-				expectIMEEvent(t, events, "suspend", "")
+				expectIMELifecycle(t, events, hc, "suspend", "")
 				check(r.blur())
 				check(r.key("command"))
 				if focusDuringSuspension {
@@ -475,16 +519,16 @@ func TestIMEBlurSurvivesSuspensionUntilRealFocus(t *testing.T) {
 					}
 					check(r.startEpisode("text"))
 				}
-				expectIMEEvent(t, events, "activate", "text")
+				expectIMELifecycle(t, events, hc, "activate", "text")
 				check(r.close())
-				expectIMEEvent(t, events, "close", "")
+				expectIMELifecycle(t, events, hc, "close", "")
 			})
 		}
 	}
 }
 
 func TestIMEBlurBeforeDeclarationBlocksInput(t *testing.T) {
-	path, events := imeTestServer(t, false, "", nil)
+	path, events := imeTestServer(t, false, nil)
 	r := newIMEReporter(path)
 	if err := r.blur(); err != nil {
 		t.Fatal(err)
@@ -507,7 +551,7 @@ func TestIMEBlurBeforeDeclarationBlocksInput(t *testing.T) {
 }
 
 func TestIMEExplicitBlurAfterInactiveACKBlocksInput(t *testing.T) {
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"inactive"}`, generation, session)
 	})
 	r := newIMEReporter(path)
@@ -530,7 +574,7 @@ func TestIMEExplicitBlurAfterInactiveACKBlocksInput(t *testing.T) {
 }
 
 func TestTUIIMEInactiveWaitsForRealKeyAndCurrentClassifier(t *testing.T) {
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		if request.Op == "state" {
 			return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"inactive"}`, generation, session)
 		}
@@ -560,7 +604,7 @@ func TestTUIIMEInactiveWaitsForRealKeyAndCurrentClassifier(t *testing.T) {
 }
 
 func TestTUIIMEInactiveCommandDoesNotDispatchOrQuit(t *testing.T) {
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"inactive"}`, generation, session)
 	})
 	m := NewModel([]model.Issue{{ID: "zh-1", Title: "中文", Status: model.StatusOpen}}, nil, "")
@@ -579,88 +623,164 @@ func TestTUIIMEInactiveCommandDoesNotDispatchOrQuit(t *testing.T) {
 	expectIMEEvent(t, events, "close", "")
 }
 
-func setHerdrIMEEnv(t *testing.T, path string) {
+// directDaemonCanary points HOME at a valid direct ime-control socket and
+// counts connections, proving hc launches never fall back to it.
+func directDaemonCanary(t *testing.T) *atomic.Uint64 {
 	t.Helper()
-	t.Setenv("HERDR_IME_INTENT", "1")
-	t.Setenv("HERDR_ENV", "1")
-	t.Setenv("HERDR_SOCKET_PATH", path)
-	t.Setenv("HERDR_PANE_ID", "pane-fixture")
-	t.Setenv("HERDR_IME_POPUP_TERMINAL_ID", "")
+	home, err := os.MkdirTemp("/tmp", "bvh-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(home) })
+	if home, err = filepath.EvalSymlinks(home); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	path, err := localIMESocket()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var accepted atomic.Uint64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			conn.Close()
+		}
+	}()
+	t.Cleanup(func() { listener.Close(); <-done })
+	return &accepted
+}
+
+func setHCIMEEnv(t *testing.T, path string) {
+	t.Helper()
+	t.Setenv("HC_TERMINAL_ID", "t7")
+	t.Setenv("HC_TERMINAL_SOCKET", path)
 	t.Setenv("SSH_CONNECTION", "fixture remote")
 	t.Setenv("SSH_TTY", "/dev/pts/fixture")
 	t.Setenv("DISPLAY", "")
 	t.Setenv("WAYLAND_DISPLAY", "")
 }
 
-func TestHerdrIMEOpensOnlyExplicitPaneOrPopupIntent(t *testing.T) {
-	for _, popup := range []bool{false, true} {
-		name := "pane"
-		if popup {
-			name = "popup"
-		}
-		t.Run(name, func(t *testing.T) {
-			path, events := imeTestServer(t, true, "", nil)
-			setHerdrIMEEnv(t, path)
-			t.Setenv("HOME", filepath.Dir(path)) // no local host daemon here
-			field, identity := "pane_id", "pane-fixture"
-			if popup {
-				t.Setenv("HERDR_PANE_ID", "")
-				t.Setenv("HERDR_IME_POPUP_TERMINAL_ID", "popup-fixture")
-				field, identity = "popup_terminal_id", "popup-fixture"
-			}
-			m := NewModel(nil, nil, "")
-			defer m.Stop()
-			if err := m.EnableTUIIME(); err != nil {
-				t.Fatal(err)
-			}
-			open := expectIMEEvent(t, events, "", "")
-			if len(open.params) != 1 || open.params[field] != identity {
-				t.Fatalf("stream opened an unintended terminal: %+v", open.params)
-			}
-			activate := expectIMEEvent(t, events, "activate", "command")
-			if activate.session != open.session || !m.imeFocused {
-				t.Fatal("recorded intent did not stay on the opened persistent stream")
-			}
-			m.CloseIME()
-			expectIMEEvent(t, events, "close", "")
-		})
+func TestHCIMESelectionPrecedesDirectDaemon(t *testing.T) {
+	path, events := imeTestServer(t, true, nil)
+	canary := directDaemonCanary(t)
+	t.Setenv("HC_TERMINAL_ID", "")
+	t.Setenv("HC_TERMINAL_SOCKET", "")
+	direct, err := selectIMEReporter()
+	if err != nil || direct.hc != nil {
+		t.Fatalf("no hc env must select the direct daemon: %v", err)
+	}
+	setHCIMEEnv(t, path)
+	// herdr-core leaves its socket 0755 inside a private directory.
+	if err := os.Chmod(path, 0755); err != nil {
+		t.Fatal(err)
+	}
+	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
+	defer m.Stop()
+	if err := m.EnableTUIIME(); err != nil || m.imeReporter == nil || m.imeReporter.hc == nil || !m.imeFocused {
+		t.Fatalf("hc env must select the hc transport before SSH/GUI checks: %v", err)
+	}
+	first := expectIMEEvent(t, events, "label", hcTestLabel(t, "command"))
+	if first.params["terminal"] != "t7" {
+		t.Fatalf("label written to the wrong terminal: %+v", first.params)
+	}
+	if m.imeReporter.session != "hc:t7" || m.imeReporter.generation != 1 {
+		t.Fatalf("synthetic ACK identity = %s/%d", m.imeReporter.session, m.imeReporter.generation)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	if event := expectIMEEvent(t, events, "label", hcTestLabel(t, "text")); event.session != first.session {
+		t.Fatal("hc transport did not keep one persistent connection")
+	}
+	m.CloseIME()
+	expectIMEEvent(t, events, "label", "")
+	if canary.Load() != 0 {
+		t.Fatal("hc launch contacted the direct daemon")
 	}
 }
 
-func TestHerdrIMERejectsInvalidLaunchWithoutDirectFallback(t *testing.T) {
-	for _, scenario := range []string{"empty-marker", "unsupported", "bad-marker", "missing-env", "no-target", "both-targets", "relative-socket", "socket-symlink", "public-socket", "public-directory"} {
+func TestHCIMELifecycleMapping(t *testing.T) {
+	path, events := imeTestServer(t, true, nil)
+	r := newHCTestReporter(t, path)
+	check := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(r.startEpisode("command"))
+	expectIMEEvent(t, events, "label", hcTestLabel(t, "command"))
+	check(r.report("text"))
+	expectIMEEvent(t, events, "label", hcTestLabel(t, "text"))
+	check(r.suspend())
+	expectIMEEvent(t, events, "label", hcTestLabel(t, "idle"))
+	check(r.finishSuspension("command"))
+	expectIMEEvent(t, events, "label", hcTestLabel(t, "command"))
+	check(r.key("command"))
+	noIMEEvent(t, events)
+	check(r.blur())
+	expectIMEEvent(t, events, "label", hcTestLabel(t, "idle"))
+	r.mu.Lock()
+	scope, err := r.exchange(imeRequest{Op: "state", State: "text"})
+	generation := r.generation
+	r.mu.Unlock()
+	if err != nil || scope != "recorded" {
+		t.Fatalf("state while not held must be accepted: %s %v", scope, err)
+	}
+	noIMEEvent(t, events)
+	if generation != 6 {
+		t.Fatalf("synthetic generation = %d; want 6", generation)
+	}
+	check(r.close())
+	expectIMEEvent(t, events, "label", "")
+	noIMEEvent(t, events)
+}
+
+func TestHCIMEPartialOrUnsafeLaunchDisablesWithoutDirectFallback(t *testing.T) {
+	for _, scenario := range []string{"only-terminal", "only-socket", "relative-socket", "dot-socket", "socket-symlink", "public-directory", "missing-socket"} {
 		t.Run(scenario, func(t *testing.T) {
-			path, events := imeTestServer(t, true, "", nil)
-			setHerdrIMEEnv(t, path)
+			path, events := imeTestServer(t, true, nil)
+			canary := directDaemonCanary(t)
+			setHCIMEEnv(t, path)
 			switch scenario {
-			case "empty-marker":
-				t.Setenv("HERDR_IME_INTENT", "")
-			case "unsupported":
-				t.Setenv("HERDR_IME_INTENT", "unsupported")
-			case "bad-marker":
-				t.Setenv("HERDR_IME_INTENT", "yes")
-			case "missing-env":
-				t.Setenv("HERDR_ENV", "")
-			case "no-target":
-				t.Setenv("HERDR_PANE_ID", "")
-			case "both-targets":
-				t.Setenv("HERDR_IME_POPUP_TERMINAL_ID", "popup-fixture")
+			case "only-terminal":
+				t.Setenv("HC_TERMINAL_SOCKET", "")
+			case "only-socket":
+				t.Setenv("HC_TERMINAL_ID", "")
 			case "relative-socket":
-				t.Setenv("HERDR_SOCKET_PATH", "control.sock")
+				t.Setenv("HC_TERMINAL_SOCKET", "control.sock")
+			case "dot-socket":
+				t.Setenv("HC_TERMINAL_SOCKET", filepath.Dir(path)+"/./control.sock")
 			case "socket-symlink":
 				link := filepath.Join(filepath.Dir(path), "alias.sock")
 				if err := os.Symlink(path, link); err != nil {
 					t.Fatal(err)
 				}
-				t.Setenv("HERDR_SOCKET_PATH", link)
-			case "public-socket":
-				if err := os.Chmod(path, 0666); err != nil {
-					t.Fatal(err)
-				}
+				t.Setenv("HC_TERMINAL_SOCKET", link)
 			case "public-directory":
 				if err := os.Chmod(filepath.Dir(path), 0755); err != nil {
 					t.Fatal(err)
 				}
+			case "missing-socket":
+				t.Setenv("HC_TERMINAL_SOCKET", filepath.Join(filepath.Dir(path), "missing.sock"))
 			}
 			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
 			defer m.Stop()
@@ -669,21 +789,88 @@ func TestHerdrIMERejectsInvalidLaunchWithoutDirectFallback(t *testing.T) {
 			}
 			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
 			if m.list.FilterState() != list.Filtering {
-				t.Fatal("invalid marker prevented ordinary search")
+				t.Fatal("invalid launch prevented ordinary search")
 			}
 			m.Update(tea.FocusMsg{})
 			if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
 				t.Fatal("invalid launch retried its reporter")
 			}
 			noIMEEvent(t, events)
+			if canary.Load() != 0 {
+				t.Fatal("invalid hc launch fell back to the direct daemon")
+			}
 		})
 	}
+}
+
+func TestHCIMERejectsInvalidRepliesWithoutReplay(t *testing.T) {
+	for _, scenario := range []string{"error", "wrong-id", "string-id", "no-result", "no-labels", "other-value", "missing-value", "malformed", "oversized"} {
+		t.Run(scenario, func(t *testing.T) {
+			path, events := imeTestServer(t, true, func(request imeRequest, session string, id uint64) string {
+				result := fmt.Sprintf(`"result":{"labels":{"imekit.intent":%q}}`, request.State)
+				switch scenario {
+				case "error":
+					return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"error":{"code":-32602,"message":"fixture"}}`, id)
+				case "wrong-id":
+					return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,%s}`, id+1, result)
+				case "string-id":
+					return fmt.Sprintf(`{"jsonrpc":"2.0","id":"%d",%s}`, id, result)
+				case "no-result":
+					return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d}`, id)
+				case "no-labels":
+					return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"terminal":"t7"}}`, id)
+				case "other-value":
+					return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"labels":{"imekit.intent":"1:1:text"}}}`, id)
+				case "missing-value":
+					return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"labels":{}}}`, id)
+				case "malformed":
+					return "{"
+				case "oversized":
+					return strings.Repeat(" ", 4096) + "{}"
+				}
+				return ""
+			})
+			setHCIMEEnv(t, path)
+			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
+			defer m.Stop()
+			if err := m.EnableTUIIME(); err != nil || !m.imeDisabled || m.imeReporter != nil || m.imeFocused {
+				t.Fatal("invalid hc reply must disable only optional intent")
+			}
+			expectIMEEvent(t, events, "label", hcTestLabel(t, "command"))
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+			if m.list.FilterState() != list.Filtering {
+				t.Fatal("rejected reply prevented ordinary search")
+			}
+			if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
+				t.Fatal("failed hc transport was reopened and replayed")
+			}
+			noIMEEvent(t, events)
+		})
+	}
+}
+
+func TestHCIMECloseRequiresDeletedLabel(t *testing.T) {
+	path, events := imeTestServer(t, true, func(request imeRequest, session string, id uint64) string {
+		if request.State == "" {
+			return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"result":{"labels":{"imekit.intent":"stale"}}}`, id)
+		}
+		return ""
+	})
+	r := newHCTestReporter(t, path)
+	if err := r.startEpisode("command"); err != nil {
+		t.Fatal(err)
+	}
+	expectIMEEvent(t, events, "label", hcTestLabel(t, "command"))
+	if err := r.close(); err == nil {
+		t.Fatal("close accepted a reply that kept imekit.intent")
+	}
+	expectIMEEvent(t, events, "label", "")
 }
 
 func TestIMEProtocolRejectsBadScopeIdentityAndFramesWithoutReplay(t *testing.T) {
 	for _, scenario := range []string{"missing-scope", "recorded-direct", "pending-state", "wrong-session", "backward-generation", "zero-generation", "malformed", "oversized", "unknown-field"} {
 		t.Run(scenario, func(t *testing.T) {
-			path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+			path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 				if generation == 1 {
 					return fmt.Sprintf(`{"ok":true,"generation":4,"session":%q,"scope":"applied"}`, session)
 				}
@@ -731,64 +918,11 @@ func TestIMEProtocolRejectsBadScopeIdentityAndFramesWithoutReplay(t *testing.T) 
 	}
 }
 
-func TestHerdrIMERejectsIncompleteOpenAndLocalScopes(t *testing.T) {
-	for _, scenario := range []string{"wrong-id", "wrong-type", "empty-session", "zero-generation", "error", "oversized-open", "applied", "inactive", "pending", "wrong-session", "stale-generation"} {
-		t.Run(scenario, func(t *testing.T) {
-			open, scope := "", ""
-			switch scenario {
-			case "wrong-id":
-				open = `{"id":"other","result":{"type":"pane_input_intent_stream_opened","session":"lease-1","generation":1}}`
-			case "wrong-type":
-				open = `{"id":"ime:open","result":{"type":"ok","session":"lease-1","generation":1}}`
-			case "empty-session":
-				open = `{"id":"ime:open","result":{"type":"pane_input_intent_stream_opened","session":"","generation":1}}`
-			case "zero-generation":
-				open = `{"id":"ime:open","result":{"type":"pane_input_intent_stream_opened","session":"lease-1","generation":0}}`
-			case "error":
-				open = `{"id":"ime:open","error":{"code":"TARGET_NOT_FOUND","message":"fixture"}}`
-			case "oversized-open":
-				open = strings.Repeat(" ", 4096) + "{}"
-			case "wrong-session":
-				scope = "recorded"
-			case "stale-generation":
-				open = `{"id":"ime:open","result":{"type":"pane_input_intent_stream_opened","session":"lease-1","generation":5}}`
-				scope = "recorded"
-			default:
-				scope = scenario
-			}
-			path, events := imeTestServer(t, true, open, func(request imeRequest, session string, generation uint64) string {
-				if scenario == "wrong-session" {
-					session = "not-the-opened-stream"
-				}
-				return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":%q}`, generation, session, scope)
-			})
-			setHerdrIMEEnv(t, path)
-			m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
-			defer m.Stop()
-			if err := m.EnableTUIIME(); err != nil || !m.imeDisabled || m.imeReporter != nil || m.imeFocused {
-				t.Fatal("bad open, scope or identity must disable only optional intent")
-			}
-			expectIMEEvent(t, events, "", "")
-			if scope != "" {
-				expectIMEEvent(t, events, "activate", "command")
-			}
-			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
-			if m.list.FilterState() != list.Filtering {
-				t.Fatal("rejected stream prevented ordinary search")
-			}
-			if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
-				t.Fatal("bad stream was reopened and replayed")
-			}
-			noIMEEvent(t, events)
-		})
-	}
-}
-
 func TestTUIIMEHandoffReturnDeclaresCurrentModeBeforeInput(t *testing.T) {
 	for _, editor := range []bool{false, true} {
 		for _, editing := range []bool{false, true} {
 			t.Run(fmt.Sprintf("editor=%v/text=%v", editor, editing), func(t *testing.T) {
-				path, events := imeTestServer(t, false, "", nil)
+				path, events := imeTestServer(t, false, nil)
 				m := NewModel(nil, nil, "")
 				defer m.Stop()
 				m.imeReporter = newIMEReporter(path)
@@ -825,16 +959,15 @@ func TestTUIIMEHandoffReturnDeclaresCurrentModeBeforeInput(t *testing.T) {
 	}
 }
 
-func TestHerdrIMEParentChildReturnKeepsStreamAndClaimsBeforeInput(t *testing.T) {
-	path, events := imeTestServer(t, true, "", nil)
-	setHerdrIMEEnv(t, path)
+func TestHCIMEParentChildReturnKeepsConnectionAndClaimsBeforeInput(t *testing.T) {
+	path, events := imeTestServer(t, true, nil)
+	setHCIMEEnv(t, path)
 	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
 	defer m.Stop()
 	if err := m.EnableTUIIME(); err != nil {
 		t.Fatal(err)
 	}
-	parent := expectIMEEvent(t, events, "", "")
-	expectIMEEvent(t, events, "activate", "command")
+	parent := expectIMEEvent(t, events, "label", hcTestLabel(t, "command"))
 	_, suspend := m.Update(tea.KeyMsg{Type: tea.KeyCtrlZ})
 	if suspend == nil {
 		t.Fatal("Ctrl-Z did not hand off the terminal")
@@ -842,9 +975,9 @@ func TestHerdrIMEParentChildReturnKeepsStreamAndClaimsBeforeInput(t *testing.T) 
 	if _, ok := suspend().(tea.SuspendMsg); !ok {
 		t.Fatal("Ctrl-Z did not request real process suspension")
 	}
-	event := expectIMEEvent(t, events, "suspend", "")
+	event := expectIMEEvent(t, events, "label", hcTestLabel(t, "idle"))
 	if event.session != parent.session {
-		t.Fatal("parent suspension did not retain its original stream")
+		t.Fatal("parent suspension did not retain its original connection")
 	}
 	m.Update(tea.FocusMsg{})
 	noIMEEvent(t, events)
@@ -855,35 +988,34 @@ func TestHerdrIMEParentChildReturnKeepsStreamAndClaimsBeforeInput(t *testing.T) 
 	if err := child.startEpisode("text"); err != nil {
 		t.Fatal(err)
 	}
-	childOpen := expectIMEEvent(t, events, "", "")
-	expectIMEEvent(t, events, "activate", "text")
-	if childOpen.session == parent.session {
-		t.Fatal("parent and child shared an owner")
+	childEvent := expectIMEEvent(t, events, "label", hcTestLabel(t, "text"))
+	if childEvent.session == parent.session {
+		t.Fatal("parent and child shared a connection")
 	}
 	if err := child.close(); err != nil {
 		t.Fatal(err)
 	}
-	expectIMEEvent(t, events, "close", "")
+	expectIMEEvent(t, events, "label", "")
 	m.Update(tea.ResumeMsg{})
-	event = expectIMEEvent(t, events, "activate", "command")
+	event = expectIMEEvent(t, events, "label", hcTestLabel(t, "command"))
 	if event.session != parent.session {
-		t.Fatal("parent resume recreated its stream instead of resuming the suspended owner")
+		t.Fatal("parent resume reconnected instead of reusing its connection")
 	}
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	noIMEEvent(t, events)
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
-	expectIMEEvent(t, events, "state", "text")
+	expectIMEEvent(t, events, "label", hcTestLabel(t, "text"))
 	if m.list.FilterState() != list.Filtering {
 		t.Fatal("first post-resume key did not dispatch once")
 	}
 	m.CloseIME()
-	expectIMEEvent(t, events, "close", "")
+	expectIMEEvent(t, events, "label", "")
 }
 
 func TestTUIIMEEditorCompletionCannotAcquireInBackground(t *testing.T) {
 	var foreground atomic.Bool
 	foreground.Store(true)
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		if request.Op == "activate" && !foreground.Load() {
 			return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"inactive"}`, generation, session)
 		}
@@ -919,7 +1051,7 @@ func TestTUIIMEEditorCompletionCannotAcquireInBackground(t *testing.T) {
 }
 
 func TestTUIIMEPendingBlurDoesNotAuthorizeBackgroundUpdates(t *testing.T) {
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		if request.Op == "blur" {
 			return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"pending"}`, generation, session)
 		}
@@ -946,7 +1078,7 @@ func TestTUIIMEPendingBlurDoesNotAuthorizeBackgroundUpdates(t *testing.T) {
 func TestIMESocketRejectsAncestorSymlinkAndPublicAncestor(t *testing.T) {
 	for _, scenario := range []string{"ancestor-symlink", "public-ancestor"} {
 		t.Run(scenario, func(t *testing.T) {
-			path, events := imeTestServer(t, false, "", nil)
+			path, events := imeTestServer(t, false, nil)
 			parent := filepath.Dir(path)
 			outer := filepath.Join(parent, "outer")
 			private := filepath.Join(outer, "private")
@@ -987,7 +1119,7 @@ func TestIMESocketRejectsAncestorSymlinkAndPublicAncestor(t *testing.T) {
 }
 
 func TestIMEAcceptsExactly4096ByteACKFrame(t *testing.T) {
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		frame := fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"applied"}`, generation, session)
 		return strings.Repeat(" ", 4095-len(frame)) + frame // final newline is byte 4096
 	})
@@ -1003,7 +1135,7 @@ func TestIMEAcceptsExactly4096ByteACKFrame(t *testing.T) {
 }
 
 func TestTUIIMERealFocusReassertsCurrentModeWithoutReporterBlur(t *testing.T) {
-	path, events := imeTestServer(t, false, "", nil)
+	path, events := imeTestServer(t, false, nil)
 	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
 	defer m.Stop()
 	m.imeReporter = newIMEReporter(path)
@@ -1058,7 +1190,7 @@ func TestIMETransportEOFCannotReconnectWithCachedMode(t *testing.T) {
 }
 
 func TestTUIIMERealKeyDiscoversObserverOnlyFocusPause(t *testing.T) {
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		if request.Op == "resume" {
 			return fmt.Sprintf(`{"ok":true,"generation":%d,"session":%q,"scope":"inactive"}`, generation, session)
 		}
@@ -1086,9 +1218,9 @@ func TestTUIIMERealKeyDiscoversObserverOnlyFocusPause(t *testing.T) {
 	expectIMEEvent(t, events, "close", "")
 }
 
-func TestHerdrIMECoalescedKeyDisablesEOFAndContinuesUICommand(t *testing.T) {
+func TestHCIMECoalescedKeyDisablesEOFAndContinuesUICommand(t *testing.T) {
 	path, listener := imeTestListener(t)
-	setHerdrIMEEnv(t, path)
+	setHCIMEEnv(t, path)
 	serverDone := make(chan error, 1)
 	go func() {
 		conn, err := listener.Accept()
@@ -1103,15 +1235,12 @@ func TestHerdrIMECoalescedKeyDisablesEOFAndContinuesUICommand(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		if _, err := fmt.Fprintln(conn, `{"id":"ime:open","result":{"type":"pane_input_intent_stream_opened","session":"lease-fixture","generation":1}}`); err != nil {
+		label, err := imeProcessGroup()
+		if err != nil {
 			serverDone <- err
 			return
 		}
-		if _, err := reader.ReadBytes('\n'); err != nil {
-			serverDone <- err
-			return
-		}
-		if _, err := fmt.Fprintln(conn, `{"ok":true,"generation":2,"session":"lease-fixture","scope":"recorded"}`); err != nil {
+		if _, err := fmt.Fprintf(conn, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"labels\":{\"imekit.intent\":\"1:%d:command\"}}}\n", label); err != nil {
 			serverDone <- err
 			return
 		}
@@ -1129,27 +1258,27 @@ func TestHerdrIMECoalescedKeyDisablesEOFAndContinuesUICommand(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("fixture did not close its intent stream")
+		t.Fatal("fixture did not close its connection")
 	}
 	_, command := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
 	if !m.imeDisabled || m.imeReporter != nil || m.imeFocused || m.focused != focusBoard {
-		t.Fatal("stream EOF must disable IME and continue ordinary board navigation")
+		t.Fatal("connection EOF must disable IME and continue ordinary board navigation")
 	}
 	if command != nil {
 		if _, ok := command().(tea.QuitMsg); ok {
-			t.Fatal("stream EOF requested Bubble Tea quit")
+			t.Fatal("connection EOF requested Bubble Tea quit")
 		}
 	}
 	m.Update(tea.FocusMsg{})
 	m.Update(tea.ResumeMsg{})
 	if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
-		t.Fatal("disabled stream was reopened")
+		t.Fatal("disabled transport was reopened")
 	}
 }
 
 func TestTUIIMEStartupMissingContinuesWithoutReplay(t *testing.T) {
-	path, events := imeTestServer(t, true, "", nil)
-	setHerdrIMEEnv(t, filepath.Join(filepath.Dir(path), "missing.sock"))
+	path, events := imeTestServer(t, true, nil)
+	setHCIMEEnv(t, filepath.Join(filepath.Dir(path), "missing.sock"))
 	m := NewModel([]model.Issue{{ID: "fixture", Title: "fixture", Status: model.StatusOpen}}, nil, "")
 	defer m.Stop()
 	if err := m.EnableTUIIME(); err != nil || !m.imeDisabled || m.imeReporter != nil {
@@ -1162,7 +1291,7 @@ func TestTUIIMEStartupMissingContinuesWithoutReplay(t *testing.T) {
 		t.Fatal("missing component prevented ordinary search")
 	}
 	// Even a now-valid transport must not revive old process intent.
-	t.Setenv("HERDR_SOCKET_PATH", path)
+	t.Setenv("HC_TERMINAL_SOCKET", path)
 	m.Update(tea.FocusMsg{})
 	m.Update(tea.ResumeMsg{})
 	if err := m.EnableTUIIME(); err != nil || m.imeReporter != nil {
@@ -1175,7 +1304,7 @@ func TestTUIIMEStartupMissingContinuesWithoutReplay(t *testing.T) {
 func TestTUIIMERejectedLifecycleRemainsOptional(t *testing.T) {
 	for _, op := range []string{"activate", "state", "blur", "suspend", "close"} {
 		t.Run(op, func(t *testing.T) {
-			path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+			path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 				if request.Op == op {
 					return fmt.Sprintf(`{"ok":false,"generation":%d,"error":"FOCUS_UNAVAILABLE"}`, generation)
 				}
@@ -1248,7 +1377,7 @@ func (m *imeEditorProgram) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func TestTUIIMERejectedEditorHandoffRunsChildAndRecovers(t *testing.T) {
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		if request.Op == "suspend" {
 			return `{"ok":false,"generation":2,"error":"BACKEND_UNAVAILABLE"}`
 		}
@@ -1287,7 +1416,7 @@ func TestTUIIMERejectedEditorHandoffRunsChildAndRecovers(t *testing.T) {
 
 func TestTUIIMESignalCloseFailureConcurrentWithInputAndFocus(t *testing.T) {
 	rejectClose := make(chan struct{})
-	path, events := imeTestServer(t, false, "", func(request imeRequest, session string, generation uint64) string {
+	path, events := imeTestServer(t, false, func(request imeRequest, session string, generation uint64) string {
 		if request.Op == "close" {
 			<-rejectClose
 			return fmt.Sprintf(`{"ok":false,"generation":%d,"error":"BACKEND_UNAVAILABLE"}`, generation)

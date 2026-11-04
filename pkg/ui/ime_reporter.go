@@ -16,20 +16,21 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 )
 
-// imeReporter serializes one interactive app's lifecycle. Herdr receives only
-// intent; ordinary local terminals use the daemon that owns the input source.
-// A failed connection is never reopened with a cached mode.
+// imeReporter serializes one interactive app's lifecycle. Under herdr-core the
+// hc transport records only intent as a terminal label; ordinary local
+// terminals use the daemon that owns the input source. A failed connection is
+// never reopened with a cached mode.
 type imeReporter struct {
 	mu         sync.Mutex
 	path       string
-	openParams map[string]string // nil for the ordinary local daemon
+	hc         *hcTransport // nil for the ordinary local daemon
 	conn       net.Conn
 	reader     *bufio.Reader
 	session    string
 	generation uint64
 	state      string
 	declared   bool
-	active     bool // applied locally, or recorded by Herdr; never inferred
+	active     bool // applied locally, or recorded by herdr-core; never inferred
 	suspended  bool // terminal is currently handed to a child
 	focusLost  bool // explicit BlurMsg; input and child return cannot override it
 	closed     bool
@@ -50,20 +51,34 @@ type imeResponse struct {
 	Error      string `json:"error"`
 }
 
-type imeOpenResponse struct {
-	ID     string `json:"id"`
-	Result *struct {
-		Type       string `json:"type"`
-		Session    string `json:"session"`
-		Generation uint64 `json:"generation"`
-	} `json:"result"`
-	Error *struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
+// hcTransport writes the imekit.intent label of this process's herdr-core
+// terminal (docs/protocol.md in imekit, "reporter：hc transport"). It keeps its
+// own held flag and answers the lifecycle with synthetic recorded ACKs.
+type hcTransport struct {
+	terminal   string
+	pgid       int
+	held       bool
+	nextID     uint64
+	generation uint64
+}
+
+const hcIntentLabel = "imekit.intent"
+
+type hcLabelResponse struct {
+	ID     *uint64         `json:"id"`
+	Result *hcLabelResult  `json:"result"`
+	Error  json.RawMessage `json:"error"`
+}
+
+type hcLabelResult struct {
+	Labels map[string]any `json:"labels"`
 }
 
 func newIMEReporter(path string) *imeReporter { return &imeReporter{path: path} }
+
+func newHCIMEReporter(path, terminal string, pgid int) *imeReporter {
+	return &imeReporter{path: path, hc: &hcTransport{terminal: terminal, pgid: pgid}}
+}
 
 func localIMESocket() (string, error) {
 	home, err := os.UserHomeDir()
@@ -74,31 +89,22 @@ func localIMESocket() (string, error) {
 }
 
 func selectIMEReporter() (*imeReporter, error) {
-	marker, present := os.LookupEnv("HERDR_IME_INTENT")
-	if !present {
+	terminal, socket := os.Getenv("HC_TERMINAL_ID"), os.Getenv("HC_TERMINAL_SOCKET")
+	if terminal == "" && socket == "" {
 		path, err := localIMESocket()
 		if err != nil {
 			return nil, err
 		}
 		return newIMEReporter(path), nil
 	}
-	if marker != "1" {
-		return nil, errors.New("HERDR_IME_INTENT_UNSUPPORTED: expected marker 1")
+	if terminal == "" || socket == "" {
+		return nil, errors.New("hc transport requires both HC_TERMINAL_ID and HC_TERMINAL_SOCKET")
 	}
-	if os.Getenv("HERDR_ENV") != "1" {
-		return nil, errors.New("HERDR_IME_INTENT_INVALID: HERDR_ENV must be 1")
+	pgid, err := imeProcessGroup()
+	if err != nil {
+		return nil, err
 	}
-	pane, popup := os.Getenv("HERDR_PANE_ID"), os.Getenv("HERDR_IME_POPUP_TERMINAL_ID")
-	if (pane == "") == (popup == "") {
-		return nil, errors.New("HERDR_IME_INTENT_INVALID: exactly one pane or popup identity is required")
-	}
-	path := os.Getenv("HERDR_SOCKET_PATH")
-	field, identity := "pane_id", pane
-	if popup != "" {
-		field, identity = "popup_terminal_id", popup
-	}
-	params := map[string]string{field: identity}
-	return &imeReporter{path: path, openParams: params}, nil
+	return newHCIMEReporter(socket, terminal, pgid), nil
 }
 
 func decodeIMEFrame(frame []byte, response any) error {
@@ -114,27 +120,9 @@ func decodeIMEFrame(frame []byte, response any) error {
 }
 
 func (r *imeReporter) transact(request any, response any) error {
-	frame, err := json.Marshal(request)
+	line, err := r.roundTrip(request)
 	if err != nil {
 		return err
-	}
-	frame = append(frame, '\n')
-	if len(frame) > 4096 {
-		return errors.New("IME request exceeds 4096 bytes")
-	}
-	n, err := r.conn.Write(frame)
-	if err != nil || n != len(frame) {
-		if err == nil {
-			err = errors.New("short IME request write")
-		}
-		return fmt.Errorf("send IME request: %w", err)
-	}
-	line, err := r.reader.ReadSlice('\n')
-	if err != nil || len(line) > 4096 {
-		if err == nil || errors.Is(err, bufio.ErrBufferFull) {
-			err = errors.New("IME ACK exceeds 4096 bytes")
-		}
-		return fmt.Errorf("receive IME ACK: %w", err)
 	}
 	if err := decodeIMEFrame(line, response); err != nil {
 		return fmt.Errorf("invalid IME ACK: %w", err)
@@ -142,11 +130,36 @@ func (r *imeReporter) transact(request any, response any) error {
 	return nil
 }
 
-func (r *imeReporter) connect() error {
-	if err := validateIMESocket(r.path); err != nil {
-		if r.openParams != nil {
-			return fmt.Errorf("HERDR_IME_INTENT_INVALID: %w", err)
+func (r *imeReporter) roundTrip(request any) ([]byte, error) {
+	frame, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	frame = append(frame, '\n')
+	if len(frame) > 4096 {
+		return nil, errors.New("IME request exceeds 4096 bytes")
+	}
+	n, err := r.conn.Write(frame)
+	if err != nil || n != len(frame) {
+		if err == nil {
+			err = errors.New("short IME request write")
 		}
+		return nil, fmt.Errorf("send IME request: %w", err)
+	}
+	line, err := r.reader.ReadSlice('\n')
+	if err != nil || len(line) > 4096 {
+		if err == nil || errors.Is(err, bufio.ErrBufferFull) {
+			err = errors.New("IME ACK exceeds 4096 bytes")
+		}
+		return nil, fmt.Errorf("receive IME ACK: %w", err)
+	}
+	return line, nil
+}
+
+func (r *imeReporter) connect() error {
+	// herdr-core leaves its socket 0755; the private parent directory protects it.
+	identity, err := validateIMESocket(r.path, r.hc == nil)
+	if err != nil {
 		return err
 	}
 	conn, err := net.DialTimeout("unix", r.path, time.Second)
@@ -155,29 +168,91 @@ func (r *imeReporter) connect() error {
 	}
 	r.conn = conn
 	r.reader = bufio.NewReaderSize(conn, 4096)
-	if err := conn.SetDeadline(time.Now().Add(4 * time.Second)); err != nil {
-		return err
+	if r.hc != nil {
+		if again, err := statIMESocket(r.path); err != nil || again != identity {
+			return errors.New("hc socket was replaced while connecting")
+		}
 	}
-	if r.openParams == nil {
-		return nil
+	return conn.SetDeadline(time.Now().Add(4 * time.Second))
+}
+
+// exchangeHC maps one lifecycle request onto the imekit.intent label. A state
+// update while not held is accepted without a write.
+func (r *imeReporter) exchangeHC(request imeRequest) (imeResponse, error) {
+	h := r.hc
+	label := func(state string) (string, error) {
+		if state != "command" && state != "text" && state != "idle" {
+			return "", fmt.Errorf("invalid IME state %q", state)
+		}
+		return fmt.Sprintf("1:%d:%s", h.pgid, state), nil
 	}
+	var value string
+	var err error
+	write, held := true, h.held
+	switch request.Op {
+	case "activate", "resume":
+		value, err = label(request.State)
+		held = true
+	case "state":
+		write = h.held
+		if write {
+			value, err = label(request.State)
+		}
+	case "blur", "suspend":
+		value, err = label("idle")
+		held = false
+	case "close":
+		held = false
+	default:
+		err = fmt.Errorf("unsupported IME lifecycle %q", request.Op)
+	}
+	if err != nil {
+		return imeResponse{}, err
+	}
+	if write {
+		if err := r.writeHCLabel(value); err != nil {
+			return imeResponse{}, err
+		}
+	}
+	h.held = held
+	h.generation++
+	return imeResponse{OK: true, Generation: h.generation, Session: "hc:" + h.terminal, Scope: "recorded"}, nil
+}
+
+func (r *imeReporter) writeHCLabel(value string) error {
+	h := r.hc
+	h.nextID++
 	request := struct {
-		ID     string            `json:"id"`
-		Method string            `json:"method"`
-		Params map[string]string `json:"params"`
-	}{"ime:open", "pane.input_intent.stream", r.openParams}
-	var response imeOpenResponse
-	if err := r.transact(request, &response); err != nil {
+		JSONRPC string `json:"jsonrpc"`
+		ID      uint64 `json:"id"`
+		Method  string `json:"method"`
+		Params  struct {
+			Terminal string            `json:"terminal"`
+			Labels   map[string]string `json:"labels"`
+		} `json:"params"`
+	}{JSONRPC: "2.0", ID: h.nextID, Method: "terminal.label"}
+	request.Params.Terminal = h.terminal
+	request.Params.Labels = map[string]string{hcIntentLabel: value}
+	line, err := r.roundTrip(request)
+	if err != nil {
 		return err
 	}
-	if response.ID != "ime:open" || response.Error != nil || response.Result == nil {
-		return errors.New("Herdr rejected or mismatched input intent stream open")
+	var response hcLabelResponse
+	if err := json.Unmarshal(line, &response); err != nil {
+		return fmt.Errorf("invalid hc reply: %w", err)
 	}
-	result := response.Result
-	if result.Type != "pane_input_intent_stream_opened" || result.Session == "" || result.Generation == 0 {
-		return errors.New("Herdr returned incomplete input intent stream open")
+	if response.ID == nil || *response.ID != h.nextID || len(response.Error) != 0 ||
+		response.Result == nil || response.Result.Labels == nil {
+		return errors.New("hc rejected or mismatched terminal.label")
 	}
-	r.session, r.generation = result.Session, result.Generation
+	got, present := response.Result.Labels[hcIntentLabel]
+	if value == "" {
+		if present {
+			return errors.New("hc kept a cleared imekit.intent label")
+		}
+	} else if got != value {
+		return errors.New("hc recorded a different imekit.intent label")
+	}
 	return nil
 }
 
@@ -202,7 +277,12 @@ func (r *imeReporter) exchange(request imeRequest) (scope string, err error) {
 		return "", err
 	}
 	var response imeResponse
-	if err = r.transact(request, &response); err != nil {
+	if r.hc != nil {
+		response, err = r.exchangeHC(request)
+	} else {
+		err = r.transact(request, &response)
+	}
+	if err != nil {
 		return "", err
 	}
 	if !response.OK {
@@ -212,9 +292,9 @@ func (r *imeReporter) exchange(request imeRequest) (scope string, err error) {
 		(r.session != "" && response.Session != r.session) || response.Generation < r.generation {
 		return "", errors.New("IME service returned incomplete or stale ACK identity")
 	}
-	if r.openParams != nil {
+	if r.hc != nil {
 		if response.Scope != "recorded" {
-			return "", errors.New("Herdr ACK must have recorded scope")
+			return "", errors.New("hc ACK must have recorded scope")
 		}
 	} else if response.Scope != "applied" && response.Scope != "inactive" &&
 		!(response.Scope == "pending" && request.Op == "blur") {
@@ -230,6 +310,9 @@ func (r *imeReporter) drop() {
 	}
 	r.conn = nil
 	r.reader = nil
+	if r.hc != nil {
+		r.hc.held = false
+	}
 	r.active = false
 	r.declared = false
 	r.state = ""
@@ -259,21 +342,21 @@ func (r *imeReporter) startEpisodeLocked(state string, realKey bool) error {
 	if r.closed || r.suspended || r.focusLost {
 		return nil
 	}
-	if realKey && r.openParams != nil && r.active {
+	if realKey && r.hc != nil && r.active {
 		if r.reader.Buffered() != 0 {
-			r.failure = errors.New("unsolicited data on Herdr IME intent stream")
+			r.failure = errors.New("unsolicited data on hc connection")
 			r.drop()
 			return r.failure
 		}
 		if err := checkIMESocketAlive(r.conn); err != nil {
-			r.failure = fmt.Errorf("Herdr IME intent stream disconnected: %w", err)
+			r.failure = fmt.Errorf("hc connection lost: %w", err)
 			r.drop()
 			return r.failure
 		}
 		return r.reportLocked(state)
 	}
 	request := imeRequest{Op: "activate", State: state, Policy: "mode"}
-	if realKey && r.openParams == nil && r.active {
+	if realKey && r.hc == nil && r.active {
 		request = imeRequest{Op: "resume", State: state}
 	}
 	scope, err := r.exchange(request)
@@ -372,7 +455,7 @@ func (r *imeReporter) close() error {
 	return err
 }
 
-// EnableTUIIME is called only by the interactive program path. Herdr transport
+// EnableTUIIME is called only by the interactive program path. hc transport
 // selection precedes ordinary SSH/GUI exclusions in the program entrypoint.
 func (m *Model) EnableTUIIME() error {
 	if m.imeDisabled || m.imeReporter != nil {

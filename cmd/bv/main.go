@@ -4552,8 +4552,8 @@ func main() {
 }
 
 func runTUIProgram(m *ui.Model) error {
-	// Only interactive paths reach this entrypoint. An explicit Herdr marker
-	// selects intent transport before ordinary SSH/headless/GUI exclusions.
+	// Only interactive paths reach this entrypoint. herdr-core's terminal env
+	// selects the hc transport before ordinary SSH/headless/GUI exclusions.
 	stdin, inErr := os.Stdin.Stat()
 	stdout, outErr := os.Stdout.Stat()
 	localGUI := inErr == nil && outErr == nil &&
@@ -4561,8 +4561,8 @@ func runTUIProgram(m *ui.Model) error {
 		os.Getenv("SSH_CONNECTION") == "" && os.Getenv("SSH_CLIENT") == "" &&
 		os.Getenv("SSH_TTY") == "" && os.Getenv("TERM") != "dumb" &&
 		(runtime.GOOS == "darwin" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "")
-	_, herdrIME := os.LookupEnv("HERDR_IME_INTENT")
-	if herdrIME || localGUI {
+	hcIME := os.Getenv("HC_TERMINAL_ID") != "" || os.Getenv("HC_TERMINAL_SOCKET") != ""
+	if hcIME || localGUI {
 		_ = m.EnableTUIIME()
 	}
 	closeIME := m.IMEShutdown()
